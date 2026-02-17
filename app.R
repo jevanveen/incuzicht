@@ -1,13 +1,12 @@
 # app.R
-# IncuZicht: Plate Map Builder (6/12/24/48/96 well)
-# Updates requested:
-# 1) Long table view is the default (show_grid = FALSE)
-# 2) Move the dynamic status output ABOVE the horizontal separator
+# IncuZicht: Plate Map + Incucyte Data Import (up to 3 files)
 
 library(shiny)
 library(rhandsontable)
 
-# ---- helpers ----
+# -------------------------
+# Plate map helpers
+# -------------------------
 plate_dims <- function(n_wells) {
   switch(
     as.character(n_wells),
@@ -36,7 +35,6 @@ make_plate_map <- function(n_wells) {
   grid[["receptor b"]] <- ""
   grid[["passage number"]] <- ""
   grid[["experiment number"]] <- ""
-  
   grid[["notes"]] <- ""
   
   grid[, c(
@@ -84,55 +82,182 @@ factor_fields <- c(
   "passage number", "experiment number"
 )
 
-# ---- app ----
+# -------------------------
+# Incucyte import helpers
+# -------------------------
+
+# Parse a file like:
+# Vessel Name: ...
+# Date Time\tElapsed\tA1\tA2...
+# ...data rows...
+read_incucyte_txt <- function(path) {
+  lines <- readLines(path, warn = FALSE)
+  
+  # Vessel Name (optional)
+  vessel <- NA_character_
+  vessel_idx <- grep("^\\s*Vessel Name\\s*:", lines, ignore.case = TRUE)
+  if (length(vessel_idx) >= 1) {
+    vessel <- sub("^\\s*Vessel Name\\s*:\\s*", "", lines[vessel_idx[1]], ignore.case = TRUE)
+    vessel <- trimws(vessel)
+    if (!nzchar(vessel)) vessel <- NA_character_
+  }
+  
+  # Find header line (starts with "Date Time")
+  hdr_idx <- grep("^\\s*Date Time\\b", lines, ignore.case = FALSE)
+  if (length(hdr_idx) == 0) stop("Could not find a header line starting with 'Date Time' in: ", basename(path))
+  
+  # Read table from header onward
+  dat <- read.table(
+    text = paste(lines[hdr_idx[1]:length(lines)], collapse = "\n"),
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    check.names = FALSE,
+    stringsAsFactors = FALSE,
+    comment.char = ""
+  )
+  
+  # Minimal validation
+  if (!("Date Time" %in% names(dat))) stop("Missing 'Date Time' column in: ", basename(path))
+  if (!("Elapsed" %in% names(dat))) stop("Missing 'Elapsed' column in: ", basename(path))
+  
+  # Keep Date Time as character for now; you can parse later if you want
+  # dat[["Date Time"]] <- as.POSIXct(dat[["Date Time"]], format = "%m/%d/%Y %I:%M:%S %p", tz = "America/Los_Angeles")
+  
+  list(vessel = vessel, wide = dat)
+}
+
+incucyte_wide_to_long <- function(wide_df) {
+  id_cols <- c("Date Time", "Elapsed")
+  well_cols <- setdiff(names(wide_df), id_cols)
+  
+  mat <- as.matrix(wide_df[well_cols])
+  # column-major: all rows for A1, then all rows for A2, etc.
+  value <- as.vector(mat)
+  
+  data.frame(
+    `Date Time` = rep(wide_df[["Date Time"]], times = length(well_cols)),
+    Elapsed = rep(wide_df[["Elapsed"]], times = length(well_cols)),
+    Well = rep(well_cols, each = nrow(wide_df)),
+    Value = value,
+    stringsAsFactors = FALSE
+  )
+}
+
+guess_plate_size_from_wells <- function(well_names) {
+  # Supports A1..H12 etc. Returns 6/12/24/48/96 or NA if ambiguous.
+  # Assumes well names like A1, A2, ... D6 (no leading zeros) as in your files.  [oai_citation:2‡AM_18_013026_greenintensity_data.txt](sediment://file_0000000001c871fd86381789a035c2aa)
+  rows <- sub("^([A-Za-z]).*$", "\\1", well_names)
+  cols <- suppressWarnings(as.integer(sub("^[A-Za-z]+", "", well_names)))
+  rows <- toupper(rows)
+  rows <- rows[!is.na(rows) & nzchar(rows)]
+  cols <- cols[!is.na(cols)]
+  
+  if (!length(rows) || !length(cols)) return(NA_integer_)
+  
+  nrow <- length(unique(rows))
+  ncol <- length(unique(cols))
+  
+  # Map to canonical plates
+  if (nrow == 2 && ncol == 3) return(6L)
+  if (nrow == 3 && ncol == 4) return(12L)
+  if (nrow == 4 && ncol == 6) return(24L)
+  if (nrow == 6 && ncol == 8) return(48L)
+  if (nrow == 8 && ncol == 12) return(96L)
+  NA_integer_
+}
+
+# -------------------------
+# UI
+# -------------------------
 ui <- fluidPage(
-  titlePanel("IncuZicht: Plate Map Input"),
-  sidebarLayout(
-    sidebarPanel(
-      selectInput(
-        "plate_size", "Plate size",
-        choices = c("6" = 6, "12" = 12, "24" = 24, "48" = 48, "96" = 96),
-        selected = 96
-      ),
-      actionButton("new_map", "New blank plate map"),
-      tags$hr(),
-      checkboxInput("show_grid", "Show grid view (A–H by 1–12)", value = FALSE), # <-- default long table
-      selectInput(
-        "grid_field",
-        "Grid edits write to:",
-        choices = c(factor_fields, "notes"),
-        selected = "hormone a"
-      ),
-      tags$hr(),
-      fileInput("upload_map", "Upload plate map (.csv)", accept = c(".csv")),
-      downloadButton("download_map", "Download plate map (.csv)"),
-      tags$hr(),
-      helpText("Use include=FALSE to mark empty/unused wells (excluded from later analysis).")
+  titlePanel("IncuZicht"),
+  tabsetPanel(
+    id = "main_tabs",
+    
+    tabPanel(
+      "Plate Map",
+      sidebarLayout(
+        sidebarPanel(
+          selectInput(
+            "plate_size", "Plate size",
+            choices = c("6" = 6, "12" = 12, "24" = 24, "48" = 48, "96" = 96),
+            selected = 96
+          ),
+          actionButton("new_map", "New blank plate map"),
+          tags$hr(),
+          checkboxInput("show_grid", "Show grid view (A–H by 1–12)", value = FALSE),
+          selectInput(
+            "grid_field",
+            "Grid edits write to:",
+            choices = c(factor_fields, "notes"),
+            selected = "hormone a"
+          ),
+          tags$hr(),
+          fileInput("upload_map", "Upload plate map (.csv)", accept = c(".csv")),
+          downloadButton("download_map", "Download plate map (.csv)"),
+          tags$hr(),
+          helpText("Use include=FALSE to mark empty/unused wells (excluded from later analysis).")
+        ),
+        mainPanel(
+          conditionalPanel(
+            condition = "input.show_grid == true",
+            h4("Grid view (editable)"),
+            p("Grid edits the selected field. To exclude wells, use the long table to toggle include."),
+            rHandsontableOutput("plate_grid")
+          ),
+          conditionalPanel(
+            condition = "input.show_grid == false",
+            h4("Long table view (editable)"),
+            rHandsontableOutput("plate_long")
+          ),
+          tags$br(),
+          verbatimTextOutput("plate_map_status"),
+          tags$hr()
+        )
+      )
     ),
-    mainPanel(
-      # Table outputs (dynamic based on input.show_grid)
-      conditionalPanel(
-        condition = "input.show_grid == true",
-        h4("Grid view (editable)"),
-        p("Grid edits the selected field. To exclude wells, use the long table to toggle include."),
-        rHandsontableOutput("plate_grid")
-      ),
-      conditionalPanel(
-        condition = "input.show_grid == false",
-        h4("Long table view (editable)"),
-        rHandsontableOutput("plate_long")
-      ),
-      
-      # Status moved ABOVE the horizontal separator
-      tags$br(),
-      verbatimTextOutput("plate_map_status"),
-      tags$hr()
+    
+    tabPanel(
+      "Import Data",
+      sidebarLayout(
+        sidebarPanel(
+          fileInput(
+            "incu_files",
+            "Upload up to 3 Incucyte data files (.txt)",
+            multiple = TRUE,
+            accept = c(".txt", ".tsv", ".csv")
+          ),
+          helpText("Expected: optional 'Vessel Name:' line, then tab-delimited header 'Date Time', 'Elapsed', well columns (A1, A2, ...)."),
+          tags$hr(),
+          checkboxInput("make_long", "Also build long format (recommended)", value = TRUE),
+          checkboxInput("try_guess_plate", "Guess plate size from well names", value = TRUE)
+        ),
+        mainPanel(
+          h4("Import summary"),
+          tableOutput("import_summary"),
+          tags$hr(),
+          h4("Preview: selected file"),
+          selectInput("preview_file", "Choose file to preview:", choices = character(0)),
+          h5("Wide (first 8 rows)"),
+          tableOutput("preview_wide"),
+          conditionalPanel(
+            condition = "input.make_long == true",
+            h5("Long (first 12 rows)"),
+            tableOutput("preview_long")
+          )
+        )
+      )
     )
   )
 )
 
+# -------------------------
+# Server
+# -------------------------
 server <- function(input, output, session) {
   
+  # ---- Plate map state ----
   plate_map <- reactiveVal(make_plate_map(96))
   
   observeEvent(input$new_map, {
@@ -150,7 +275,6 @@ server <- function(input, output, session) {
     plate_map(df)
   })
   
-  # ---- Long table ----
   output$plate_long <- renderRHandsontable({
     rhandsontable(
       plate_map(),
@@ -172,7 +296,6 @@ server <- function(input, output, session) {
     plate_map(df)
   })
   
-  # ---- Grid view ----
   output$plate_grid <- renderRHandsontable({
     df <- plate_map()
     d  <- plate_dims(as.integer(input$plate_size))
@@ -227,9 +350,7 @@ server <- function(input, output, session) {
   
   output$download_map <- downloadHandler(
     filename = function() paste0("plate_map_", input$plate_size, "well.csv"),
-    content = function(file) {
-      write.csv(plate_map(), file, row.names = FALSE, na = "")
-    }
+    content = function(file) write.csv(plate_map(), file, row.names = FALSE, na = "")
   )
   
   output$plate_map_status <- renderPrint({
@@ -248,6 +369,90 @@ server <- function(input, output, session) {
     cat("\nPreview (first 10 wells):\n")
     print(utils::head(df, 10))
   })
+  
+  # ---- Import data state ----
+  incu_data <- reactiveVal(list())
+  
+  observeEvent(input$incu_files, {
+    req(input$incu_files)
+    
+    if (nrow(input$incu_files) > 3) {
+      showNotification("Please upload at most 3 files.", type = "error")
+      return(NULL)
+    }
+    
+    files <- input$incu_files
+    out <- list()
+    
+    for (i in seq_len(nrow(files))) {
+      path <- files$datapath[i]
+      fname <- files$name[i]
+      
+      parsed <- read_incucyte_txt(path)
+      wide <- parsed$wide
+      wells <- setdiff(names(wide), c("Date Time", "Elapsed"))
+      
+      long <- NULL
+      if (isTRUE(input$make_long)) {
+        long <- incucyte_wide_to_long(wide)
+      }
+      
+      guessed_plate <- NA_integer_
+      if (isTRUE(input$try_guess_plate)) {
+        guessed_plate <- guess_plate_size_from_wells(wells)
+      }
+      
+      out[[fname]] <- list(
+        filename = fname,
+        vessel = parsed$vessel,
+        wide = wide,
+        long = long,
+        n_timepoints = nrow(wide),
+        n_wells = length(wells),
+        guessed_plate = guessed_plate
+      )
+    }
+    
+    incu_data(out)
+    
+    updateSelectInput(
+      session, "preview_file",
+      choices = names(out),
+      selected = names(out)[1]
+    )
+  })
+  
+  output$import_summary <- renderTable({
+    dat <- incu_data()
+    if (!length(dat)) return(NULL)
+    
+    data.frame(
+      file = vapply(dat, `[[`, character(1), "filename"),
+      vessel = vapply(dat, function(x) ifelse(is.na(x$vessel), "", x$vessel), character(1)),
+      timepoints = vapply(dat, `[[`, integer(1), "n_timepoints"),
+      wells = vapply(dat, `[[`, integer(1), "n_wells"),
+      guessed_plate = vapply(dat, function(x) ifelse(is.na(x$guessed_plate), "", as.character(x$guessed_plate)), character(1)),
+      stringsAsFactors = FALSE
+    )
+  }, striped = TRUE, bordered = TRUE, spacing = "s")
+  
+  output$preview_wide <- renderTable({
+    dat <- incu_data()
+    req(length(dat))
+    req(input$preview_file)
+    wide <- dat[[input$preview_file]]$wide
+    utils::head(wide, 8)
+  }, striped = TRUE, bordered = TRUE, spacing = "s")
+  
+  output$preview_long <- renderTable({
+    req(isTRUE(input$make_long))
+    dat <- incu_data()
+    req(length(dat))
+    req(input$preview_file)
+    long <- dat[[input$preview_file]]$long
+    req(!is.null(long))
+    utils::head(long, 12)
+  }, striped = TRUE, bordered = TRUE, spacing = "s")
 }
 
 shinyApp(ui, server)
