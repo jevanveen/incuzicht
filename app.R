@@ -1,557 +1,696 @@
 # app.R
-# Incucyte Multi-File Import + Channel Normalization (Passage as surrogate BioRep)
-# + Condition header parser -> receptor + treatment factors (defaults: receptor="none", treatment="VEH")
-# + Prism export (wide, 1 row per elapsed): elapsed in rows; columns = receptor/treatment/passages
-#   organized first by receptor then by treatment, replicates stacked by Passage.
-# + Plot defaults: facet by Passage; color by receptor.
+# IncuZicht: Plate Map + Incucyte Import + Join
+# NEW: Import Data tab lets user assign friendly labels to uploaded files (up to 3).
 
 library(shiny)
-library(tidyverse)
-libraryreadr <- readr::read_delim
-library(readr)
-library(stringr)
+library(rhandsontable)
 
-# ---------------------------
-# Helpers: parse Incucyte header metadata
-# ---------------------------
-find_data_header_row <- function(lines) {
-  idx <- which(str_detect(lines, "^Date Time\\tElapsed\\b"))
-  if (length(idx) == 0) return(NA_integer_)
-  idx[1]
+# -------------------------
+# Plate map helpers
+# -------------------------
+plate_dims <- function(n_wells) {
+  switch(
+    as.character(n_wells),
+    "6"  = list(nrow = 2, ncol = 3),
+    "12" = list(nrow = 3, ncol = 4),
+    "24" = list(nrow = 4, ncol = 6),
+    "48" = list(nrow = 6, ncol = 8),
+    "96" = list(nrow = 8, ncol = 12),
+    stop("Unsupported plate size: ", n_wells)
+  )
 }
 
-extract_key_value <- function(lines, key) {
-  pat <- paste0("^", stringr::fixed(key), "\\s*:\\s*(.*)$")
-  hit <- lines[str_detect(lines, pat)]
-  if (length(hit) == 0) return(NA_character_)
-  val <- str_match(hit[1], pat)[, 2]
-  if (is.na(val)) NA_character_ else str_trim(val)
+make_plate_map <- function(n_wells) {
+  d <- plate_dims(n_wells)
+  rows <- LETTERS[seq_len(d$nrow)]
+  cols <- seq_len(d$ncol)
+  
+  grid <- expand.grid(Row = rows, Col = cols, KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+  grid$Well <- sprintf("%s%02d", grid$Row, grid$Col)
+  
+  grid[["include"]] <- TRUE
+  
+  grid[["hormone a"]] <- ""
+  grid[["hormone b"]] <- ""
+  grid[["receptor a"]] <- ""
+  grid[["receptor b"]] <- ""
+  grid[["passage number"]] <- ""
+  grid[["experiment number"]] <- ""
+  grid[["notes"]] <- ""
+  
+  grid[, c(
+    "Well", "Row", "Col",
+    "include",
+    "hormone a", "hormone b",
+    "receptor a", "receptor b",
+    "passage number", "experiment number",
+    "notes"
+  )]
 }
 
-read_incucyte_header_meta <- function(path) {
+infer_plate_size_from_plate_map <- function(df) {
+  n <- nrow(df)
+  if (n %in% c(6, 12, 24, 48, 96)) return(as.integer(n))
+  
+  if (!all(c("Row", "Col") %in% names(df))) return(NA_integer_)
+  nrow_u <- length(unique(df$Row))
+  ncol_u <- length(unique(df$Col))
+  
+  if (nrow_u == 2 && ncol_u == 3) return(6L)
+  if (nrow_u == 3 && ncol_u == 4) return(12L)
+  if (nrow_u == 4 && ncol_u == 6) return(24L)
+  if (nrow_u == 6 && ncol_u == 8) return(48L)
+  if (nrow_u == 8 && ncol_u == 12) return(96L)
+  
+  NA_integer_
+}
+
+validate_plate_map <- function(df, n_wells) {
+  req_cols <- c(
+    "Well", "Row", "Col", "include",
+    "hormone a", "hormone b",
+    "receptor a", "receptor b",
+    "passage number", "experiment number"
+  )
+  missing <- setdiff(req_cols, names(df))
+  if (length(missing)) stop("Plate map missing required columns: ", paste(missing, collapse = ", "))
+  
+  d <- plate_dims(n_wells)
+  expected <- d$nrow * d$ncol
+  if (nrow(df) != expected) stop("Plate map has ", nrow(df), " rows; expected ", expected, " for a ", n_wells, "-well plate.")
+  
+  if (any(!grepl("^[A-Z][0-9]{2}$", df$Well))) stop("Some 'Well' values are not like A01, B12, etc.")
+  
+  rows <- LETTERS[seq_len(d$nrow)]
+  if (any(!df$Row %in% rows)) stop("Some 'Row' values are not valid for this plate size.")
+  if (any(!df$Col %in% seq_len(d$ncol))) stop("Some 'Col' values are not valid for this plate size.")
+  
+  if (!is.logical(df$include)) {
+    df$include <- tolower(as.character(df$include)) %in% c("true", "t", "1", "yes", "y")
+  }
+  
+  if (!("notes" %in% names(df))) df[["notes"]] <- ""
+  
+  df
+}
+
+factor_fields <- c(
+  "hormone a", "hormone b",
+  "receptor a", "receptor b",
+  "passage number", "experiment number"
+)
+
+# -------------------------
+# Incucyte import helpers
+# -------------------------
+read_incucyte_txt <- function(path) {
   lines <- readLines(path, warn = FALSE)
-  header_i <- find_data_header_row(lines)
-  if (is.na(header_i)) stop("Couldn't find data header row starting with 'Date Time<TAB>Elapsed'.")
-  meta_lines <- lines[1:(header_i - 1)]
-  tibble(
-    vessel_name = extract_key_value(meta_lines, "Vessel Name"),
-    metric      = extract_key_value(meta_lines, "Metric"),
-    cell_type   = extract_key_value(meta_lines, "Cell Type"),
-    passage     = extract_key_value(meta_lines, "Passage"),
-    notes       = extract_key_value(meta_lines, "Notes"),
-    analysis    = extract_key_value(meta_lines, "Analysis")
+  
+  vessel <- NA_character_
+  vessel_idx <- grep("^\\s*Vessel Name\\s*:", lines, ignore.case = TRUE)
+  if (length(vessel_idx) >= 1) {
+    vessel <- sub("^\\s*Vessel Name\\s*:\\s*", "", lines[vessel_idx[1]], ignore.case = TRUE)
+    vessel <- trimws(vessel)
+    if (!nzchar(vessel)) vessel <- NA_character_
+  }
+  
+  hdr_idx <- grep("^\\s*Date Time\\b", lines, ignore.case = FALSE)
+  if (length(hdr_idx) == 0) stop("Could not find a header line starting with 'Date Time' in: ", basename(path))
+  
+  dat <- read.table(
+    text = paste(lines[hdr_idx[1]:length(lines)], collapse = "\n"),
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    check.names = FALSE,
+    stringsAsFactors = FALSE,
+    comment.char = ""
+  )
+  
+  if (!("Date Time" %in% names(dat))) stop("Missing 'Date Time' column in: ", basename(path))
+  if (!("Elapsed" %in% names(dat))) stop("Missing 'Elapsed' column in: ", basename(path))
+  
+  list(vessel = vessel, wide = dat)
+}
+
+normalize_well <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  m <- regexec("^([A-Z]+)\\s*0*([0-9]+)$", x)
+  reg <- regmatches(x, m)
+  out <- x
+  ok <- lengths(reg) == 3
+  if (any(ok)) {
+    row <- vapply(reg[ok], `[[`, character(1), 2)
+    col <- as.integer(vapply(reg[ok], `[[`, character(1), 3))
+    out[ok] <- sprintf("%s%02d", row, col)
+  }
+  out
+}
+
+incucyte_wide_to_long <- function(wide_df) {
+  id_cols <- c("Date Time", "Elapsed")
+  well_cols <- setdiff(names(wide_df), id_cols)
+  
+  norm_cols <- normalize_well(well_cols)
+  names(wide_df)[match(well_cols, names(wide_df))] <- norm_cols
+  well_cols <- norm_cols
+  
+  mat <- as.matrix(wide_df[well_cols])
+  value <- as.vector(mat)
+  
+  data.frame(
+    `Date Time` = rep(wide_df[["Date Time"]], times = length(well_cols)),
+    Elapsed = rep(wide_df[["Elapsed"]], times = length(well_cols)),
+    Well = rep(well_cols, each = nrow(wide_df)),
+    Value = value,
+    stringsAsFactors = FALSE
   )
 }
 
-# ---------------------------
-# Reader: Incucyte wide-by-condition export -> tidy long
-# ---------------------------
-read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
-  lines <- readLines(path, warn = FALSE)
-  header_i <- find_data_header_row(lines)
-  if (is.na(header_i)) stop("Couldn't find header row starting with 'Date Time<TAB>Elapsed'.")
+guess_plate_size_from_wells <- function(well_names_A01) {
+  rows <- sub("^([A-Z]).*$", "\\1", well_names_A01)
+  cols <- suppressWarnings(as.integer(sub("^[A-Z]+", "", well_names_A01)))
+  rows <- rows[!is.na(rows) & nzchar(rows)]
+  cols <- cols[!is.na(cols)]
+  if (!length(rows) || !length(cols)) return(NA_integer_)
   
-  txt <- paste(lines[header_i:length(lines)], collapse = "\n")
+  nrow_u <- length(unique(rows))
+  ncol_u <- length(unique(cols))
   
-  dat <- read_delim(
-    I(txt),
-    delim = "\t",
-    show_col_types = FALSE,
-    col_types = cols(.default = col_character())
-  )
-  
-  if (ncol(dat) < 3) stop("Parsed <3 columns. Is this the right Incucyte export format?")
-  names(dat)[1:2] <- c("datetime", "elapsed")
-  
-  if (drop_stderr) dat <- dat %>% select(-matches("\\(Std Err"))
-  
-  dat %>%
-    mutate(
-      datetime = as.character(datetime),
-      elapsed  = suppressWarnings(as.numeric(elapsed))
-    ) %>%
-    pivot_longer(
-      cols = -c(datetime, elapsed),
-      names_to = "condition",
-      values_to = "value"
-    ) %>%
-    mutate(
-      condition = as.character(condition),
-      value     = suppressWarnings(as.numeric(value))
-    )
+  if (nrow_u == 2 && ncol_u == 3) return(6L)
+  if (nrow_u == 3 && ncol_u == 4) return(12L)
+  if (nrow_u == 4 && ncol_u == 6) return(24L)
+  if (nrow_u == 6 && ncol_u == 8) return(48L)
+  if (nrow_u == 8 && ncol_u == 12) return(96L)
+  NA_integer_
 }
 
-# ---------------------------
-# Condition header parsing: receptor + treatment factors
-# Defaults:
-# - receptor: "none"
-# - treatment: "VEH"
-# ---------------------------
-canonicalize_receptor_token <- function(x) {
-  z <- x %>%
-    str_to_lower() %>%
-    str_replace_all("[α]", "a") %>%
-    str_replace_all("[β]", "b") %>%
-    str_replace_all("[^a-z0-9\\s]", " ") %>%
-    str_squish()
-  
-  case_when(
-    z %in% c("era", "er a", "esr1", "er1") ~ "era",
-    z %in% c("erb", "er b", "esr2", "er2") ~ "erb",
-    z %in% c("pgr", "pr", "prg") ~ "pgr",
-    z %in% c("pra", "pr a", "pr-a", "pr a isoform", "pr a iso") ~ "pra",
-    z %in% c("prb", "pr b", "pr-b", "pr b isoform", "pr b iso") ~ "prb",
-    z %in% c("gr", "nr3c1", "glucocorticoid receptor") ~ "gr",
-    TRUE ~ NA_character_
-  )
+make_safe_label <- function(x) {
+  # Friendly for downstream use: lower, trim, spaces -> _, drop weird chars
+  x <- trimws(as.character(x))
+  x <- tolower(x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[^a-z0-9_\\-]+", "", x)
+  x
 }
 
-is_vehicle_token <- function(x) {
-  z <- str_to_lower(str_squish(x))
-  z %in% c("veh", "vehicle", "etoh", "ethanol", "dmso", "pbs", "media", "control")
-}
-
-parse_treatment_token <- function(x) {
-  z <- str_squish(x)
-  m <- str_match(
-    z,
-    regex("^\\s*([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\s*([a-z0-9\\-]+)\\s*$",
-          ignore_case = TRUE)
-  )
-  if (all(is.na(m))) return(NA_character_)
-  amount <- m[, 2]
-  unit   <- toupper(m[, 3])
-  unit   <- ifelse(unit == "µM", "uM", unit)
-  comp   <- toupper(m[, 4])
-  paste0(amount, unit, " ", comp)
-}
-
-canonicalize_receptor_combo <- function(receptors) {
-  order <- c("era", "erb", "pgr", "pra", "prb", "gr")
-  recs <- unique(na.omit(receptors))
-  if (length(recs) == 0) return("none")
-  recs <- recs[order(match(recs, order, nomatch = 999))]
-  paste(recs, collapse = " + ")
-}
-
-guess_receptor_treatment <- function(condition_vec) {
-  tibble(condition_raw = condition_vec) %>%
-    mutate(
-      condition_norm = condition_raw %>%
-        str_replace_all("\\s*\\+\\s*", " + ") %>%
-        str_squish(),
-      tokens = str_split(condition_norm, " \\+ ")
-    ) %>%
-    mutate(
-      parsed = purrr::map(tokens, function(tok) {
-        tok <- str_squish(tok)
-        
-        receptor_tokens <- purrr::map_chr(tok, canonicalize_receptor_token)
-        receptors <- receptor_tokens[!is.na(receptor_tokens)]
-        non_receptor <- tok[is.na(receptor_tokens)]
-        
-        veh_idx <- purrr::map_lgl(non_receptor, is_vehicle_token)
-        conc_parsed <- purrr::map_chr(non_receptor, parse_treatment_token)
-        conc_idx <- !is.na(conc_parsed)
-        
-        treatment <- case_when(
-          any(conc_idx) ~ paste(unique(conc_parsed[conc_idx]), collapse = " + "),
-          any(veh_idx) ~ "VEH",
-          length(non_receptor) == 0 ~ "VEH",
-          TRUE ~ paste(non_receptor, collapse = " + ")
-        )
-        
-        list(
-          receptor = canonicalize_receptor_combo(receptors),
-          treatment = treatment
-        )
-      })
-    ) %>%
-    tidyr::unnest_wider(parsed) %>%
-    mutate(
-      receptor = factor(receptor),
-      treatment = factor(treatment)
-    ) %>%
-    select(condition_raw, receptor, treatment)
-}
-
-# ---------------------------
+# -------------------------
 # UI
-# ---------------------------
+# -------------------------
 ui <- fluidPage(
-  titlePanel("Incucyte Multi-File Import + Channel Normalization (Passage + receptor/treatment + Prism export)"),
-  sidebarLayout(
-    sidebarPanel(
-      fileInput(
-        "files",
-        "Upload Incucyte export files (.txt/.tsv/.csv)",
-        multiple = TRUE,
-        accept = c(".txt", ".tsv", ".csv")
-      ),
-      checkboxInput("drop_stderr", "Drop '(Std Err ...)' columns", value = TRUE),
-      uiOutput("channel_map_ui"),
-      hr(),
-      uiOutput("norm_ui"),
-      actionButton("run", "Import + Process", class = "btn-primary"),
-      hr(),
-      h4("Downloads"),
-      downloadButton("download_long", "Tidy long (csv)"),
-      downloadButton("download_wide", "Joined wide by Passage (csv)"),
-      downloadButton("download_norm", "Normalized by Passage (csv)"),
-      downloadButton("download_stats", "Stats-ready long (csv)"),
-      downloadButton("download_prism", "Prism wide export (csv)")
+  titlePanel("IncuZicht"),
+  tabsetPanel(
+    id = "main_tabs",
+    
+    tabPanel(
+      "Plate Map",
+      sidebarLayout(
+        sidebarPanel(
+          selectInput(
+            "plate_size", "Plate size",
+            choices = c("6" = 6, "12" = 12, "24" = 24, "48" = 48, "96" = 96),
+            selected = 24
+          ),
+          actionButton("new_map", "New blank plate map"),
+          tags$hr(),
+          checkboxInput("show_grid", "Show grid view (A–H by 1–12)", value = FALSE),
+          selectInput(
+            "grid_field",
+            "Grid edits write to:",
+            choices = c(factor_fields, "notes"),
+            selected = "hormone a"
+          ),
+          tags$hr(),
+          fileInput("upload_map", "Upload plate map (.csv)", accept = c(".csv")),
+          downloadButton("download_map", "Download plate map (.csv)"),
+          tags$hr(),
+          helpText("Use include=FALSE to mark empty/unused wells (excluded from later analysis).")
+        ),
+        mainPanel(
+          conditionalPanel(
+            condition = "input.show_grid == true",
+            h4("Grid view (editable)"),
+            p("Grid edits the selected field. To exclude wells, use the long table to toggle include."),
+            rHandsontableOutput("plate_grid")
+          ),
+          conditionalPanel(
+            condition = "input.show_grid == false",
+            h4("Long table view (editable)"),
+            rHandsontableOutput("plate_long")
+          ),
+          tags$br(),
+          verbatimTextOutput("plate_map_status"),
+          tags$hr()
+        )
+      )
     ),
-    mainPanel(
-      tabsetPanel(
-        tabPanel("Plot", plotOutput("plot", height = 460)),
-        tabPanel("Join checks", verbatimTextOutput("join_checks")),
-        tabPanel("Raw (tidy long)", tableOutput("preview_long")),
-        tabPanel("Joined (wide by channel)", tableOutput("preview_wide")),
-        tabPanel("Normalized", tableOutput("preview_norm")),
-        tabPanel("Stats-ready", tableOutput("preview_stats")),
-        tabPanel("Prism preview", tableOutput("preview_prism"))
+    
+    tabPanel(
+      "Import Data",
+      sidebarLayout(
+        sidebarPanel(
+          fileInput(
+            "incu_files",
+            "Upload up to 3 Incucyte data files (.txt)",
+            multiple = TRUE,
+            accept = c(".txt", ".tsv", ".csv")
+          ),
+          helpText("Wells are normalized to A01 format for joining."),
+          tags$hr(),
+          checkboxInput("make_long", "Build long format (recommended)", value = TRUE),
+          tags$hr(),
+          actionButton("apply_labels", "Apply labels")
+        ),
+        mainPanel(
+          h4("Name your files (used for wrangling later)"),
+          p("Edit the label column (e.g., green, nir, phase). Labels must be unique and non-empty."),
+          rHandsontableOutput("label_table"),
+          tags$hr(),
+          h4("Import summary"),
+          tableOutput("import_summary"),
+          tags$hr(),
+          h4("Preview: selected dataset"),
+          selectInput("preview_file", "Choose dataset to preview:", choices = character(0)),
+          h5("Wide (first 8 rows)"),
+          tableOutput("preview_wide"),
+          conditionalPanel(
+            condition = "input.make_long == true",
+            h5("Long (first 12 rows)"),
+            tableOutput("preview_long")
+          )
+        )
+      )
+    ),
+    
+    tabPanel(
+      "Merged Data",
+      sidebarLayout(
+        sidebarPanel(
+          helpText("Incucyte data joined to plate map (by Well)."),
+          tags$hr(),
+          selectInput("merged_file", "Choose dataset:", choices = character(0)),
+          checkboxInput("drop_excluded", "Drop excluded wells (include==FALSE)", value = TRUE),
+          checkboxInput("only_mapped", "Keep only wells present in plate map", value = TRUE)
+        ),
+        mainPanel(
+          h4("Join checks"),
+          verbatimTextOutput("join_checks"),
+          tags$hr(),
+          h4("Merged preview (first 20 rows)"),
+          tableOutput("merged_preview")
+        )
       )
     )
   )
 )
 
-# ---------------------------
+# -------------------------
 # Server
-# ---------------------------
+# -------------------------
 server <- function(input, output, session) {
   
-  output$channel_map_ui <- renderUI({
-    req(input$files)
-    fns <- input$files$name
-    
-    tagList(
-      h4("Assign a fluorescence channel to each file"),
-      tags$p(tags$small("Default: if filename contains 'red' anywhere → NIR.")),
-      lapply(seq_along(fns), function(i) {
-        fname <- fns[i]
-        
-        default <- if (str_detect(tolower(fname), "red")) "NIR" else
-          if (str_detect(tolower(fname), "nir")) "NIR" else
-            if (str_detect(tolower(fname), "gfp|green")) "GFP" else
-              if (str_detect(tolower(fname), "orange")) "Orange" else
-                "Other"
-        
-        fluidRow(
-          column(8, tags$small(fname)),
-          column(
-            4,
-            selectInput(
-              inputId = paste0("chan_", i),
-              label = NULL,
-              choices = c("GFP", "NIR", "Orange", "Red", "Other"),
-              selected = default
-            )
-          )
-        )
-      })
-    )
+  # Prevent plate_size observer from overwriting fresh upload auto-switch
+  suppress_plate_reset <- reactiveVal(FALSE)
+  
+  # Default plate map 24-well
+  plate_map <- reactiveVal(make_plate_map(24))
+  
+  observeEvent(input$new_map, {
+    plate_map(make_plate_map(as.integer(input$plate_size)))
   })
   
-  channel_map <- reactive({
-    req(input$files)
-    fns <- input$files$name
-    
-    get_chan <- function(i, fname) {
-      id <- paste0("chan_", i)
-      val <- input[[id]]
-      if (is.null(val) || length(val) == 0 || is.na(val) || val == "") {
-        if (str_detect(tolower(fname), "red")) return("NIR")
-        if (str_detect(tolower(fname), "nir")) return("NIR")
-        if (str_detect(tolower(fname), "gfp|green")) return("GFP")
-        if (str_detect(tolower(fname), "orange")) return("Orange")
-        return("Other")
-      }
-      val
+  observeEvent(input$plate_size, {
+    if (isTRUE(suppress_plate_reset())) {
+      suppress_plate_reset(FALSE)
+      return(NULL)
     }
-    
-    tibble(
-      file = fns,
-      path = input$files$datapath,
-      channel = purrr::map_chr(seq_along(fns), ~ get_chan(.x, fns[.x]))
-    )
-  })
-  
-  output$norm_ui <- renderUI({
-    req(channel_map())
-    chans <- sort(unique(channel_map()$channel))
-    if (length(chans) == 0) return(NULL)
-    
-    tagList(
-      h4("Normalization"),
-      selectInput("signal_channel", "Signal channel", choices = chans, selected = chans[1]),
-      selectInput(
-        "control_channel",
-        "Control channel (e.g., NIR for transfection efficiency)",
-        choices = chans,
-        selected = if ("NIR" %in% chans) "NIR" else chans[min(2, length(chans))]
-      ),
-      radioButtons(
-        "norm_method",
-        "Method",
-        choices = c(
-          "None (keep raw signal channel)" = "none",
-          "Ratio (signal/control)" = "ratio",
-          "Log2 ratio (log2(signal/control))" = "log2ratio"
-        ),
-        selected = "ratio"
-      ),
-      checkboxInput(
-        "baseline_norm",
-        "Also baseline-normalize within Passage+Condition (divide by first non-NA timepoint)",
-        value = FALSE
-      )
-    )
-  })
-  
-  # Import + add receptor/treatment
-  raw_long <- eventReactive(input$run, {
-    cm <- channel_map()
-    
-    dat <- purrr::pmap_dfr(cm, function(file, path, channel) {
-      meta <- read_incucyte_header_meta(path)
-      dat0 <- read_incucyte_wide_conditions(path, drop_stderr = isTRUE(input$drop_stderr))
-      
-      passage_chr <- meta$passage[[1]]
-      passage_lab <- if (!is.na(passage_chr) && passage_chr != "") paste0("Passage_", passage_chr) else "Passage_NA"
-      
-      dat0 %>%
-        mutate(
-          file = file,
-          channel = channel,
-          passage = factor(passage_lab),
-          vessel_name = meta$vessel_name[[1]] %||% NA_character_,
-          metric      = meta$metric[[1]] %||% NA_character_,
-          cell_type   = meta$cell_type[[1]] %||% NA_character_,
-          analysis    = meta$analysis[[1]] %||% NA_character_
-        )
-    }) %>%
-      select(file, channel, passage, vessel_name, metric, cell_type, analysis,
-             datetime, elapsed, condition, value)
-    
-    annot <- guess_receptor_treatment(unique(dat$condition))
-    
-    dat %>%
-      left_join(annot, by = c("condition" = "condition_raw")) %>%
-      mutate(
-        receptor = fct_explicit_na(receptor, na_level = "none"),
-        treatment = fct_explicit_na(treatment, na_level = "VEH")
-      ) %>%
-      relocate(receptor, treatment, .after = condition)
+    plate_map(make_plate_map(as.integer(input$plate_size)))
   }, ignoreInit = TRUE)
   
+  observeEvent(input$upload_map, {
+    req(input$upload_map)
+    
+    tryCatch({
+      df <- read.csv(input$upload_map$datapath, stringsAsFactors = FALSE, check.names = FALSE)
+      
+      inferred <- infer_plate_size_from_plate_map(df)
+      if (is.na(inferred)) stop("Could not infer plate size from uploaded plate map.")
+      
+      if (as.integer(input$plate_size) != inferred) {
+        suppress_plate_reset(TRUE)
+        updateSelectInput(session, "plate_size", selected = inferred)
+        showNotification(
+          paste0("Auto-switched plate size to ", inferred, "-well to match uploaded plate map."),
+          type = "warning", duration = 6
+        )
+      }
+      
+      df <- validate_plate_map(df, inferred)
+      plate_map(df)
+      showNotification("Plate map uploaded successfully.", type = "message", duration = 4)
+      
+    }, error = function(e) {
+      showNotification(paste0("Plate map upload failed: ", conditionMessage(e)), type = "error", duration = 10)
+    })
+  })
+  
+  output$plate_long <- renderRHandsontable({
+    rhandsontable(plate_map(), rowHeaders = NULL, stretchH = "all", height = 580) %>%
+      hot_col("Well", readOnly = TRUE) %>%
+      hot_col("Row", readOnly = TRUE) %>%
+      hot_col("Col", readOnly = TRUE) %>%
+      hot_col("include", type = "checkbox")
+  })
+  
+  observeEvent(input$plate_long, {
+    df <- hot_to_r(input$plate_long)
+    if (!is.logical(df$include)) {
+      df$include <- tolower(as.character(df$include)) %in% c("true", "t", "1", "yes", "y")
+    }
+    plate_map(df)
+  })
+  
+  output$plate_grid <- renderRHandsontable({
+    df <- plate_map()
+    d  <- plate_dims(as.integer(input$plate_size))
+    rows <- LETTERS[seq_len(d$nrow)]
+    cols <- sprintf("%02d", seq_len(d$ncol))
+    field <- input$grid_field
+    
+    mat <- matrix("", nrow = d$nrow, ncol = d$ncol, dimnames = list(rows, cols))
+    mat[cbind(match(df$Row, rows), df$Col)] <- as.character(df[[field]])
+    
+    display_mat <- mat
+    excluded <- !df$include
+    if (any(excluded)) {
+      for (i in which(excluded)) {
+        rr <- match(df$Row[i], rows)
+        cc <- df$Col[i]
+        display_mat[rr, cc] <- paste0("(x) ", display_mat[rr, cc])
+      }
+    }
+    
+    grid_df <- as.data.frame(display_mat, stringsAsFactors = FALSE)
+    grid_df <- cbind(Row = rownames(grid_df), grid_df)
+    rownames(grid_df) <- NULL
+    
+    rhandsontable(grid_df, stretchH = "all", height = 580) %>%
+      hot_col("Row", readOnly = TRUE)
+  })
+  
+  observeEvent(input$plate_grid, {
+    req(input$plate_grid)
+    grid_df <- hot_to_r(input$plate_grid)
+    
+    d <- plate_dims(as.integer(input$plate_size))
+    rows <- LETTERS[seq_len(d$nrow)]
+    cols <- sprintf("%02d", seq_len(d$ncol))
+    field <- input$grid_field
+    
+    df <- plate_map()
+    
+    for (r in rows) {
+      row_i <- which(grid_df$Row == r)
+      for (c in seq_len(d$ncol)) {
+        col_nm <- cols[c]
+        val <- as.character(grid_df[row_i, col_nm, drop = TRUE])
+        val <- sub("^\\(x\\)\\s*", "", val)
+        df[[field]][df$Row == r & df$Col == c] <- ifelse(is.na(val), "", val)
+      }
+    }
+    plate_map(df)
+  })
+  
+  output$download_map <- downloadHandler(
+    filename = function() paste0("plate_map_", input$plate_size, "well.csv"),
+    content = function(file) write.csv(plate_map(), file, row.names = FALSE, na = "")
+  )
+  
+  output$plate_map_status <- renderPrint({
+    df <- plate_map()
+    cat("Plate:", input$plate_size, "well\n")
+    cat("Included wells:", sum(df$include), " / ", nrow(df), "\n\n")
+    nonempty <- vapply(c(factor_fields, "notes"),
+                       function(nm) sum(nzchar(trimws(as.character(df[[nm]])))),
+                       integer(1))
+    cat("Non-empty cells by field:\n")
+    print(nonempty)
+    cat("\nPreview (first 10 wells):\n")
+    print(utils::head(df, 10))
+  })
+  
+  # ---- Import data + labeling state ----
+  incu_data_raw <- reactiveVal(list())   # keyed by original filenames
+  file_labels_tbl <- reactiveVal(NULL)   # data.frame(orig_file, label)
+  
+  observeEvent(input$incu_files, {
+    req(input$incu_files)
+    
+    if (nrow(input$incu_files) > 3) {
+      showNotification("Please upload at most 3 files.", type = "error")
+      return(NULL)
+    }
+    
+    files <- input$incu_files
+    out <- list()
+    
+    for (i in seq_len(nrow(files))) {
+      path <- files$datapath[i]
+      fname <- files$name[i]
+      
+      parsed <- read_incucyte_txt(path)
+      wide <- parsed$wide
+      
+      wells_raw <- setdiff(names(wide), c("Date Time", "Elapsed"))
+      wells_norm <- normalize_well(wells_raw)
+      names(wide)[match(wells_raw, names(wide))] <- wells_norm
+      
+      long <- NULL
+      if (isTRUE(input$make_long)) {
+        long <- incucyte_wide_to_long(wide)
+      }
+      
+      guessed_plate <- guess_plate_size_from_wells(wells_norm)
+      
+      out[[fname]] <- list(
+        original_filename = fname,
+        label = NA_character_,   # to be set by user
+        vessel = parsed$vessel,
+        wide = wide,
+        long = long,
+        wells = wells_norm,
+        n_timepoints = nrow(wide),
+        n_wells = length(wells_norm),
+        guessed_plate = guessed_plate
+      )
+    }
+    
+    incu_data_raw(out)
+    
+    # Initialize label table with suggested labels based on filenames
+    suggested <- vapply(names(out), function(nm) make_safe_label(tools::file_path_sans_ext(nm)), character(1))
+    tbl <- data.frame(
+      `original file` = names(out),
+      `label` = suggested,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+    file_labels_tbl(tbl)
+    
+    # Default preview choices (temporarily by original file until Apply)
+    updateSelectInput(session, "preview_file", choices = names(out), selected = names(out)[1])
+    updateSelectInput(session, "merged_file",  choices = names(out), selected = names(out)[1])
+    
+    # Warn on plate mismatch
+    sel <- as.integer(input$plate_size)
+    mism <- vapply(out, function(x) !is.na(x$guessed_plate) && x$guessed_plate != sel, logical(1))
+    if (any(mism)) {
+      bad <- paste(names(out)[mism], collapse = ", ")
+      showNotification(
+        paste0(
+          "Plate size mismatch: selected ", sel,
+          "-well, but these file(s) look like different plates: ", bad,
+          ". Joining can still proceed; use 'Keep only wells present in plate map' to filter."
+        ),
+        type = "warning", duration = 12
+      )
+    }
+  })
+  
+  output$label_table <- renderRHandsontable({
+    tbl <- file_labels_tbl()
+    if (is.null(tbl)) return(NULL)
+    
+    rhandsontable(tbl, rowHeaders = NULL, stretchH = "all", height = 160) %>%
+      hot_col("original file", readOnly = TRUE)
+  })
+  
+  observeEvent(input$label_table, {
+    file_labels_tbl(hot_to_r(input$label_table))
+  })
+  
+  # Apply labels: re-key data by label; update dropdowns
+  incu_data <- reactiveVal(list())  # final keyed-by-label list (after Apply)
+  
+  observeEvent(input$apply_labels, {
+    raw <- incu_data_raw()
+    tbl <- file_labels_tbl()
+    if (!length(raw) || is.null(tbl)) {
+      showNotification("Upload data files first.", type = "error", duration = 6)
+      return(NULL)
+    }
+    
+    labels <- make_safe_label(tbl[["label"]])
+    origs  <- tbl[["original file"]]
+    
+    if (any(!nzchar(labels))) {
+      showNotification("Labels cannot be blank. Please fill in all labels.", type = "error", duration = 8)
+      return(NULL)
+    }
+    if (any(duplicated(labels))) {
+      dup <- unique(labels[duplicated(labels)])
+      showNotification(paste0("Labels must be unique. Duplicates: ", paste(dup, collapse = ", ")),
+                       type = "error", duration = 10)
+      return(NULL)
+    }
+    if (!all(origs %in% names(raw))) {
+      showNotification("Internal mismatch: original file list changed. Try re-uploading.", type = "error", duration = 10)
+      return(NULL)
+    }
+    
+    out <- list()
+    for (i in seq_along(origs)) {
+      obj <- raw[[origs[i]]]
+      obj$label <- labels[i]
+      out[[labels[i]]] <- obj
+    }
+    
+    incu_data(out)
+    
+    updateSelectInput(session, "preview_file", choices = names(out), selected = names(out)[1])
+    updateSelectInput(session, "merged_file",  choices = names(out), selected = names(out)[1])
+    
+    showNotification("Labels applied. Datasets are now referenced by your labels.", type = "message", duration = 5)
+  })
+  
+  output$import_summary <- renderTable({
+    dat <- incu_data()
+    if (!length(dat)) {
+      # fall back to raw view pre-apply
+      dat0 <- incu_data_raw()
+      if (!length(dat0)) return(NULL)
+      return(data.frame(
+        dataset = names(dat0),
+        original_file = vapply(dat0, `[[`, character(1), "original_filename"),
+        timepoints = vapply(dat0, `[[`, integer(1), "n_timepoints"),
+        wells = vapply(dat0, `[[`, integer(1), "n_wells"),
+        guessed_plate = vapply(dat0, function(x) ifelse(is.na(x$guessed_plate), "", as.character(x$guessed_plate)), character(1)),
+        stringsAsFactors = FALSE
+      ))
+    }
+    
+    data.frame(
+      dataset = names(dat),
+      original_file = vapply(dat, `[[`, character(1), "original_filename"),
+      vessel = vapply(dat, function(x) ifelse(is.na(x$vessel), "", x$vessel), character(1)),
+      timepoints = vapply(dat, `[[`, integer(1), "n_timepoints"),
+      wells = vapply(dat, `[[`, integer(1), "n_wells"),
+      guessed_plate = vapply(dat, function(x) ifelse(is.na(x$guessed_plate), "", as.character(x$guessed_plate)), character(1)),
+      stringsAsFactors = FALSE
+    )
+  }, striped = TRUE, bordered = TRUE, spacing = "s")
+  
+  output$preview_wide <- renderTable({
+    dat <- incu_data()
+    if (!length(dat)) dat <- incu_data_raw()
+    req(length(dat), input$preview_file)
+    utils::head(dat[[input$preview_file]]$wide, 8)
+  }, striped = TRUE, bordered = TRUE, spacing = "s")
+  
   output$preview_long <- renderTable({
-    req(raw_long())
-    head(raw_long(), 20)
+    req(isTRUE(input$make_long))
+    dat <- incu_data()
+    if (!length(dat)) dat <- incu_data_raw()
+    req(length(dat), input$preview_file)
+    long <- dat[[input$preview_file]]$long
+    req(!is.null(long))
+    utils::head(long, 12)
+  }, striped = TRUE, bordered = TRUE, spacing = "s")
+  
+  # ---- JOIN: Incucyte long + plate map ----
+  merged_data <- reactive({
+    dat <- incu_data()
+    if (!length(dat)) dat <- incu_data_raw()
+    req(length(dat), input$merged_file)
+    
+    obj <- dat[[input$merged_file]]
+    req(!is.null(obj$long))
+    
+    pm <- plate_map()
+    
+    file_long <- obj$long
+    if (isTRUE(input$only_mapped)) {
+      file_long <- file_long[file_long$Well %in% pm$Well, , drop = FALSE]
+    }
+    
+    merged <- merge(file_long, pm, by = "Well", all.x = TRUE, sort = FALSE)
+    
+    if (isTRUE(input$drop_excluded)) {
+      merged <- merged[isTRUE(merged$include), , drop = FALSE]
+    }
+    
+    merged$dataset <- if (!is.na(obj$label)) obj$label else obj$original_filename
+    merged$source_file <- obj$original_filename
+    merged$vessel <- ifelse(is.na(obj$vessel), "", obj$vessel)
+    
+    merged
   })
   
   output$join_checks <- renderPrint({
-    req(raw_long())
-    rl <- raw_long()
-    
-    files_loaded <- rl %>%
-      distinct(file, channel, passage, vessel_name, metric, cell_type, analysis) %>%
-      arrange(passage, channel, file)
-    
-    per_channel <- rl %>%
-      group_by(channel) %>%
-      summarize(
-        n_rows = n(),
-        n_passages = n_distinct(passage),
-        n_conditions = n_distinct(condition),
-        n_times = n_distinct(elapsed),
-        .groups = "drop"
-      )
-    
-    parse_cov <- rl %>%
-      summarize(
-        n_conditions = n_distinct(condition),
-        receptor_levels = paste(levels(receptor), collapse = ", "),
-        treatment_levels = paste(levels(treatment), collapse = ", "),
-        receptor_none_frac = mean(as.character(receptor) == "none", na.rm = TRUE),
-        treatment_veh_frac = mean(as.character(treatment) == "VEH", na.rm = TRUE)
-      )
-    
-    list(
-      files_loaded = files_loaded,
-      per_channel_summary = per_channel,
-      parsing_coverage = parse_cov,
-      note = "Defaults: receptor='none' if no receptor token found; treatment='VEH' if no treatment token found."
-    )
-  })
-  
-  # Wide join WITHIN Passage (stats-friendly)
-  wide_joined_passage <- reactive({
-    req(raw_long())
-    raw_long() %>%
-      select(passage, channel, elapsed, condition, receptor, treatment, value) %>%
-      group_by(passage, channel, elapsed, condition, receptor, treatment) %>%
-      summarize(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
-      pivot_wider(names_from = channel, values_from = value)
-  })
-  
-  output$preview_wide <- renderTable({
-    req(wide_joined_passage())
-    head(wide_joined_passage(), 20)
-  })
-  
-  # Normalized within Passage
-  normalized_passage <- reactive({
-    req(wide_joined_passage())
-    w <- wide_joined_passage()
-    
-    method <- input$norm_method %||% "ratio"
-    sig <- input$signal_channel
-    ctl <- input$control_channel
-    
-    if (is.null(sig) || is.null(ctl) || !(sig %in% names(w)) || !(ctl %in% names(w))) {
-      return(w %>% mutate(value_norm = NA_real_))
-    }
-    
-    out <- w %>%
-      mutate(
-        value_norm = case_when(
-          method == "none" ~ .data[[sig]],
-          method == "ratio" ~ .data[[sig]] / .data[[ctl]],
-          method == "log2ratio" ~ log2(.data[[sig]] / .data[[ctl]]),
-          TRUE ~ NA_real_
-        )
-      )
-    
-    if (isTRUE(input$baseline_norm)) {
-      out <- out %>%
-        group_by(passage, condition) %>%
-        mutate(
-          baseline = value_norm[which(!is.na(value_norm))[1]],
-          value_norm = value_norm / baseline
-        ) %>%
-        ungroup() %>%
-        select(-baseline)
-    }
-    
-    out
-  })
-  
-  output$preview_norm <- renderTable({
-    req(normalized_passage())
-    head(normalized_passage(), 20)
-  })
-  
-  # Stats-ready long table
-  stats_long <- reactive({
-    req(normalized_passage())
-    normalized_passage() %>%
-      mutate(
-        receptor = fct_explicit_na(receptor, na_level = "none"),
-        treatment = fct_explicit_na(treatment, na_level = "VEH")
-      ) %>%
-      select(passage, elapsed, condition, receptor, treatment, value_norm) %>%
-      arrange(receptor, treatment, passage, condition, elapsed)
-  })
-  
-  output$preview_stats <- renderTable({
-    req(stats_long())
-    head(stats_long(), 20)
-  })
-  
-  # Prism export:
-  # Requirement: ONE ROW PER TIMEPOINT (elapsed).
-  # So we must collapse across condition within each receptor/treatment/passsage, OR choose a single condition.
-  # Here we collapse by MEAN across all conditions that map to the same receptor+treatment within a passage at each time.
-  # If you prefer "one condition only" (e.g., keep condition as separate exports), we can change this.
-  prism_wide <- reactive({
-    req(stats_long())
-    df <- stats_long() %>%
-      group_by(elapsed, receptor, treatment, passage) %>%
-      summarize(value = mean(value_norm, na.rm = TRUE), .groups = "drop") %>%
-      mutate(col_key = paste(receptor, treatment, passage, sep = "__"))
-    
-    wide <- df %>%
-      select(elapsed, col_key, value) %>%
-      pivot_wider(names_from = col_key, values_from = value)
-    
-    # order columns: receptor -> treatment -> passage
-    col_meta <- df %>%
-      distinct(col_key, receptor, treatment, passage) %>%
-      arrange(receptor, treatment, passage)
-    
-    wide %>% select(elapsed, any_of(col_meta$col_key))
-  })
-  
-  output$preview_prism <- renderTable({
-    req(prism_wide())
-    head(prism_wide(), 20)
-  })
-  
-  # Plot defaults: facet by Passage; color by receptor
-  output$plot <- renderPlot({
-    req(stats_long())
-    df <- stats_long()
-    
-    if (all(is.na(df$value_norm))) {
-      plot.new()
-      text(0.5, 0.5, "No normalized values to plot yet.\nUpload files, assign channels, choose signal/control, click 'Import + Process'.")
+    dat <- incu_data()
+    if (!length(dat)) dat <- incu_data_raw()
+    if (!length(dat) || !nzchar(input$merged_file)) {
+      cat("Upload data files to enable joining.\n")
       return()
     }
     
-    # show trajectories per condition; color by receptor; facet by passage
-    ggplot(df, aes(x = elapsed, y = value_norm, group = condition, color = receptor)) +
-      geom_line(alpha = 0.6) +
-      facet_wrap(~ passage) +
-      labs(
-        x = "Elapsed time",
-        y = "Value (normalized)",
-        title = "Normalized trajectories (facet by Passage; color by receptor)"
-      ) +
-      theme_minimal()
+    obj <- dat[[input$merged_file]]
+    pm <- plate_map()
+    
+    sel_plate <- as.integer(input$plate_size)
+    guessed <- obj$guessed_plate
+    
+    cat("Selected plate size:", sel_plate, "\n")
+    cat("Guessed plate size from file wells:", ifelse(is.na(guessed), "NA", guessed), "\n")
+    cat("Dataset key:", input$merged_file, "\n")
+    cat("Original file:", obj$original_filename, "\n\n")
+    
+    wells_in_file <- unique(obj$wells)
+    wells_in_pm <- pm$Well
+    
+    cat("File wells (normalized):", length(wells_in_file), "\n")
+    cat("Plate map wells:", length(wells_in_pm), "\n")
+    
+    extra <- setdiff(wells_in_file, wells_in_pm)
+    missing <- setdiff(wells_in_pm, wells_in_file)
+    
+    cat("\nWells in file but not on this plate map:", length(extra), "\n")
+    if (length(extra) && length(extra) <= 20) cat(paste(extra, collapse = ", "), "\n")
+    if (length(extra) > 20) cat(paste(c(extra[1:20], "..."), collapse = ", "), "\n")
+    
+    cat("\nWells on plate map but not in file:", length(missing), "\n")
+    if (length(missing) && length(missing) <= 20) cat(paste(missing, collapse = ", "), "\n")
+    if (length(missing) > 20) cat(paste(c(missing[1:20], "..."), collapse = ", "), "\n")
+    
+    cat("\nIncluded wells in plate map:", sum(pm$include), " / ", nrow(pm), "\n")
+    cat("Join behavior:\n")
+    cat(" - Keep only mapped wells:", isTRUE(input$only_mapped), "\n")
+    cat(" - Drop excluded wells:", isTRUE(input$drop_excluded), "\n")
   })
   
-  # ---------------------------
-  # Downloads
-  # ---------------------------
-  output$download_long <- downloadHandler(
-    filename = function() paste0("incucyte_tidy_long_", Sys.Date(), ".csv"),
-    content = function(file) {
-      req(raw_long())
-      write_csv(raw_long(), file)
-    }
-  )
-  
-  output$download_wide <- downloadHandler(
-    filename = function() paste0("incucyte_joined_wide_by_passage_", Sys.Date(), ".csv"),
-    content = function(file) {
-      req(wide_joined_passage())
-      write_csv(wide_joined_passage(), file)
-    }
-  )
-  
-  output$download_norm <- downloadHandler(
-    filename = function() paste0("incucyte_normalized_by_passage_", Sys.Date(), ".csv"),
-    content = function(file) {
-      req(normalized_passage())
-      write_csv(normalized_passage(), file)
-    }
-  )
-  
-  output$download_stats <- downloadHandler(
-    filename = function() paste0("incucyte_stats_ready_long_", Sys.Date(), ".csv"),
-    content = function(file) {
-      req(stats_long())
-      write_csv(stats_long(), file)
-    }
-  )
-  
-  output$download_prism <- downloadHandler(
-    filename = function() paste0("incucyte_prism_wide_1row_per_time_", Sys.Date(), ".csv"),
-    content = function(file) {
-      req(prism_wide())
-      write_csv(prism_wide(), file)
-    }
-  )
+  output$merged_preview <- renderTable({
+    utils::head(merged_data(), 20)
+  }, striped = TRUE, bordered = TRUE, spacing = "s")
 }
 
 shinyApp(ui, server)
