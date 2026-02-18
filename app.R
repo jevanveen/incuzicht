@@ -1,14 +1,6 @@
 # app.R
 # IncuZicht: Plate Map + Incucyte Import + Join
-# Updates implemented:
-# - Default plate size is 24-well
-# - Plate map upload NEVER crashes the app:
-#     * shows error message on invalid file
-#     * AUTO-SWITCHES plate size if the uploaded plate map is a different size
-# - Keeps prior functionality:
-#     * Plate Map editing (long table default, optional grid)
-#     * Import up to 3 Incucyte files
-#     * Join Incucyte long data to plate map by Well, respecting include == TRUE
+# NEW: Import Data tab lets user assign friendly labels to uploaded files (up to 3).
 
 library(shiny)
 library(rhandsontable)
@@ -57,7 +49,6 @@ make_plate_map <- function(n_wells) {
 }
 
 infer_plate_size_from_plate_map <- function(df) {
-  # Prefer row count if it matches canonical plates; fallback to Row/Col unique counts
   n <- nrow(df)
   if (n %in% c(6, 12, 24, 48, 96)) return(as.integer(n))
   
@@ -194,6 +185,15 @@ guess_plate_size_from_wells <- function(well_names_A01) {
   NA_integer_
 }
 
+make_safe_label <- function(x) {
+  # Friendly for downstream use: lower, trim, spaces -> _, drop weird chars
+  x <- trimws(as.character(x))
+  x <- tolower(x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[^a-z0-9_\\-]+", "", x)
+  x
+}
+
 # -------------------------
 # UI
 # -------------------------
@@ -209,7 +209,7 @@ ui <- fluidPage(
           selectInput(
             "plate_size", "Plate size",
             choices = c("6" = 6, "12" = 12, "24" = 24, "48" = 48, "96" = 96),
-            selected = 24  # DEFAULT 24
+            selected = 24
           ),
           actionButton("new_map", "New blank plate map"),
           tags$hr(),
@@ -255,17 +255,22 @@ ui <- fluidPage(
             multiple = TRUE,
             accept = c(".txt", ".tsv", ".csv")
           ),
-          helpText("Expected: optional 'Vessel Name:' line, then tab-delimited header 'Date Time', 'Elapsed', well columns."),
+          helpText("Wells are normalized to A01 format for joining."),
           tags$hr(),
           checkboxInput("make_long", "Build long format (recommended)", value = TRUE),
-          helpText("Wells are normalized to A01 format for joining.")
+          tags$hr(),
+          actionButton("apply_labels", "Apply labels")
         ),
         mainPanel(
+          h4("Name your files (used for wrangling later)"),
+          p("Edit the label column (e.g., green, nir, phase). Labels must be unique and non-empty."),
+          rHandsontableOutput("label_table"),
+          tags$hr(),
           h4("Import summary"),
           tableOutput("import_summary"),
           tags$hr(),
-          h4("Preview: selected file"),
-          selectInput("preview_file", "Choose file to preview:", choices = character(0)),
+          h4("Preview: selected dataset"),
+          selectInput("preview_file", "Choose dataset to preview:", choices = character(0)),
           h5("Wide (first 8 rows)"),
           tableOutput("preview_wide"),
           conditionalPanel(
@@ -283,7 +288,7 @@ ui <- fluidPage(
         sidebarPanel(
           helpText("Incucyte data joined to plate map (by Well)."),
           tags$hr(),
-          selectInput("merged_file", "Choose imported file:", choices = character(0)),
+          selectInput("merged_file", "Choose dataset:", choices = character(0)),
           checkboxInput("drop_excluded", "Drop excluded wells (include==FALSE)", value = TRUE),
           checkboxInput("only_mapped", "Keep only wells present in plate map", value = TRUE)
         ),
@@ -304,10 +309,10 @@ ui <- fluidPage(
 # -------------------------
 server <- function(input, output, session) {
   
-  # Prevents "plate_size change" observer from overwriting a freshly uploaded plate map
+  # Prevent plate_size observer from overwriting fresh upload auto-switch
   suppress_plate_reset <- reactiveVal(FALSE)
   
-  # DEFAULT plate map is 24-well
+  # Default plate map 24-well
   plate_map <- reactiveVal(make_plate_map(24))
   
   observeEvent(input$new_map, {
@@ -322,7 +327,6 @@ server <- function(input, output, session) {
     plate_map(make_plate_map(as.integer(input$plate_size)))
   }, ignoreInit = TRUE)
   
-  # ---- Plate map upload: safe + auto-switch ----
   observeEvent(input$upload_map, {
     req(input$upload_map)
     
@@ -330,11 +334,8 @@ server <- function(input, output, session) {
       df <- read.csv(input$upload_map$datapath, stringsAsFactors = FALSE, check.names = FALSE)
       
       inferred <- infer_plate_size_from_plate_map(df)
-      if (is.na(inferred)) {
-        stop("Could not infer plate size from uploaded plate map (row count or Row/Col layout not recognized).")
-      }
+      if (is.na(inferred)) stop("Could not infer plate size from uploaded plate map.")
       
-      # Auto-switch if mismatch
       if (as.integer(input$plate_size) != inferred) {
         suppress_plate_reset(TRUE)
         updateSelectInput(session, "plate_size", selected = inferred)
@@ -344,28 +345,17 @@ server <- function(input, output, session) {
         )
       }
       
-      df <- validate_plate_map(df, inferred)  # validate against inferred size
+      df <- validate_plate_map(df, inferred)
       plate_map(df)
-      
       showNotification("Plate map uploaded successfully.", type = "message", duration = 4)
       
     }, error = function(e) {
-      showNotification(
-        paste0("Plate map upload failed: ", conditionMessage(e)),
-        type = "error",
-        duration = 10
-      )
+      showNotification(paste0("Plate map upload failed: ", conditionMessage(e)), type = "error", duration = 10)
     })
   })
   
-  # ---- Long table ----
   output$plate_long <- renderRHandsontable({
-    rhandsontable(
-      plate_map(),
-      rowHeaders = NULL,
-      stretchH = "all",
-      height = 580
-    ) %>%
+    rhandsontable(plate_map(), rowHeaders = NULL, stretchH = "all", height = 580) %>%
       hot_col("Well", readOnly = TRUE) %>%
       hot_col("Row", readOnly = TRUE) %>%
       hot_col("Col", readOnly = TRUE) %>%
@@ -380,13 +370,11 @@ server <- function(input, output, session) {
     plate_map(df)
   })
   
-  # ---- Grid view ----
   output$plate_grid <- renderRHandsontable({
     df <- plate_map()
     d  <- plate_dims(as.integer(input$plate_size))
     rows <- LETTERS[seq_len(d$nrow)]
     cols <- sprintf("%02d", seq_len(d$ncol))
-    
     field <- input$grid_field
     
     mat <- matrix("", nrow = d$nrow, ncol = d$ncol, dimnames = list(rows, cols))
@@ -442,21 +430,18 @@ server <- function(input, output, session) {
     df <- plate_map()
     cat("Plate:", input$plate_size, "well\n")
     cat("Included wells:", sum(df$include), " / ", nrow(df), "\n\n")
-    
-    nonempty <- vapply(
-      c(factor_fields, "notes"),
-      function(nm) sum(nzchar(trimws(as.character(df[[nm]])))),
-      integer(1)
-    )
+    nonempty <- vapply(c(factor_fields, "notes"),
+                       function(nm) sum(nzchar(trimws(as.character(df[[nm]])))),
+                       integer(1))
     cat("Non-empty cells by field:\n")
     print(nonempty)
-    
     cat("\nPreview (first 10 wells):\n")
     print(utils::head(df, 10))
   })
   
-  # ---- Import data state ----
-  incu_data <- reactiveVal(list())
+  # ---- Import data + labeling state ----
+  incu_data_raw <- reactiveVal(list())   # keyed by original filenames
+  file_labels_tbl <- reactiveVal(NULL)   # data.frame(orig_file, label)
   
   observeEvent(input$incu_files, {
     req(input$incu_files)
@@ -488,7 +473,8 @@ server <- function(input, output, session) {
       guessed_plate <- guess_plate_size_from_wells(wells_norm)
       
       out[[fname]] <- list(
-        filename = fname,
+        original_filename = fname,
+        label = NA_character_,   # to be set by user
         vessel = parsed$vessel,
         wide = wide,
         long = long,
@@ -499,12 +485,23 @@ server <- function(input, output, session) {
       )
     }
     
-    incu_data(out)
+    incu_data_raw(out)
     
+    # Initialize label table with suggested labels based on filenames
+    suggested <- vapply(names(out), function(nm) make_safe_label(tools::file_path_sans_ext(nm)), character(1))
+    tbl <- data.frame(
+      `original file` = names(out),
+      `label` = suggested,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+    file_labels_tbl(tbl)
+    
+    # Default preview choices (temporarily by original file until Apply)
     updateSelectInput(session, "preview_file", choices = names(out), selected = names(out)[1])
     updateSelectInput(session, "merged_file",  choices = names(out), selected = names(out)[1])
     
-    # Warn if any file's wells don't match selected plate size (best-effort)
+    # Warn on plate mismatch
     sel <- as.integer(input$plate_size)
     mism <- vapply(out, function(x) !is.na(x$guessed_plate) && x$guessed_plate != sel, logical(1))
     if (any(mism)) {
@@ -513,20 +510,88 @@ server <- function(input, output, session) {
         paste0(
           "Plate size mismatch: selected ", sel,
           "-well, but these file(s) look like different plates: ", bad,
-          ". Joining can still proceed; choose 'Keep only wells present in plate map' to filter."
+          ". Joining can still proceed; use 'Keep only wells present in plate map' to filter."
         ),
-        type = "warning",
-        duration = 12
+        type = "warning", duration = 12
       )
     }
   })
   
+  output$label_table <- renderRHandsontable({
+    tbl <- file_labels_tbl()
+    if (is.null(tbl)) return(NULL)
+    
+    rhandsontable(tbl, rowHeaders = NULL, stretchH = "all", height = 160) %>%
+      hot_col("original file", readOnly = TRUE)
+  })
+  
+  observeEvent(input$label_table, {
+    file_labels_tbl(hot_to_r(input$label_table))
+  })
+  
+  # Apply labels: re-key data by label; update dropdowns
+  incu_data <- reactiveVal(list())  # final keyed-by-label list (after Apply)
+  
+  observeEvent(input$apply_labels, {
+    raw <- incu_data_raw()
+    tbl <- file_labels_tbl()
+    if (!length(raw) || is.null(tbl)) {
+      showNotification("Upload data files first.", type = "error", duration = 6)
+      return(NULL)
+    }
+    
+    labels <- make_safe_label(tbl[["label"]])
+    origs  <- tbl[["original file"]]
+    
+    if (any(!nzchar(labels))) {
+      showNotification("Labels cannot be blank. Please fill in all labels.", type = "error", duration = 8)
+      return(NULL)
+    }
+    if (any(duplicated(labels))) {
+      dup <- unique(labels[duplicated(labels)])
+      showNotification(paste0("Labels must be unique. Duplicates: ", paste(dup, collapse = ", ")),
+                       type = "error", duration = 10)
+      return(NULL)
+    }
+    if (!all(origs %in% names(raw))) {
+      showNotification("Internal mismatch: original file list changed. Try re-uploading.", type = "error", duration = 10)
+      return(NULL)
+    }
+    
+    out <- list()
+    for (i in seq_along(origs)) {
+      obj <- raw[[origs[i]]]
+      obj$label <- labels[i]
+      out[[labels[i]]] <- obj
+    }
+    
+    incu_data(out)
+    
+    updateSelectInput(session, "preview_file", choices = names(out), selected = names(out)[1])
+    updateSelectInput(session, "merged_file",  choices = names(out), selected = names(out)[1])
+    
+    showNotification("Labels applied. Datasets are now referenced by your labels.", type = "message", duration = 5)
+  })
+  
   output$import_summary <- renderTable({
     dat <- incu_data()
-    if (!length(dat)) return(NULL)
+    if (!length(dat)) {
+      # fall back to raw view pre-apply
+      dat0 <- incu_data_raw()
+      if (!length(dat0)) return(NULL)
+      return(data.frame(
+        dataset = names(dat0),
+        original_file = vapply(dat0, `[[`, character(1), "original_filename"),
+        timepoints = vapply(dat0, `[[`, integer(1), "n_timepoints"),
+        wells = vapply(dat0, `[[`, integer(1), "n_wells"),
+        guessed_plate = vapply(dat0, function(x) ifelse(is.na(x$guessed_plate), "", as.character(x$guessed_plate)), character(1)),
+        stringsAsFactors = FALSE
+      ))
+    }
     
     data.frame(
-      file = vapply(dat, `[[`, character(1), "filename"),
+      dataset = names(dat),
+      original_file = vapply(dat, `[[`, character(1), "original_filename"),
       vessel = vapply(dat, function(x) ifelse(is.na(x$vessel), "", x$vessel), character(1)),
       timepoints = vapply(dat, `[[`, integer(1), "n_timepoints"),
       wells = vapply(dat, `[[`, integer(1), "n_wells"),
@@ -537,6 +602,7 @@ server <- function(input, output, session) {
   
   output$preview_wide <- renderTable({
     dat <- incu_data()
+    if (!length(dat)) dat <- incu_data_raw()
     req(length(dat), input$preview_file)
     utils::head(dat[[input$preview_file]]$wide, 8)
   }, striped = TRUE, bordered = TRUE, spacing = "s")
@@ -544,6 +610,7 @@ server <- function(input, output, session) {
   output$preview_long <- renderTable({
     req(isTRUE(input$make_long))
     dat <- incu_data()
+    if (!length(dat)) dat <- incu_data_raw()
     req(length(dat), input$preview_file)
     long <- dat[[input$preview_file]]$long
     req(!is.null(long))
@@ -553,57 +620,52 @@ server <- function(input, output, session) {
   # ---- JOIN: Incucyte long + plate map ----
   merged_data <- reactive({
     dat <- incu_data()
+    if (!length(dat)) dat <- incu_data_raw()
     req(length(dat), input$merged_file)
     
-    file_obj <- dat[[input$merged_file]]
-    req(!is.null(file_obj$long))
+    obj <- dat[[input$merged_file]]
+    req(!is.null(obj$long))
     
     pm <- plate_map()
     
-    # (1) plate-map-based filtering if requested
+    file_long <- obj$long
     if (isTRUE(input$only_mapped)) {
-      file_long <- file_obj$long[file_obj$long$Well %in% pm$Well, , drop = FALSE]
-    } else {
-      file_long <- file_obj$long
+      file_long <- file_long[file_long$Well %in% pm$Well, , drop = FALSE]
     }
     
-    # (2) join by Well
-    merged <- merge(
-      file_long,
-      pm,
-      by = "Well",
-      all.x = TRUE,
-      sort = FALSE
-    )
+    merged <- merge(file_long, pm, by = "Well", all.x = TRUE, sort = FALSE)
     
-    # Respect include flag
     if (isTRUE(input$drop_excluded)) {
       merged <- merged[isTRUE(merged$include), , drop = FALSE]
     }
     
-    merged$source_file <- file_obj$filename
-    merged$vessel <- ifelse(is.na(file_obj$vessel), "", file_obj$vessel)
+    merged$dataset <- if (!is.na(obj$label)) obj$label else obj$original_filename
+    merged$source_file <- obj$original_filename
+    merged$vessel <- ifelse(is.na(obj$vessel), "", obj$vessel)
     
     merged
   })
   
   output$join_checks <- renderPrint({
     dat <- incu_data()
+    if (!length(dat)) dat <- incu_data_raw()
     if (!length(dat) || !nzchar(input$merged_file)) {
       cat("Upload data files to enable joining.\n")
       return()
     }
     
-    file_obj <- dat[[input$merged_file]]
+    obj <- dat[[input$merged_file]]
     pm <- plate_map()
     
     sel_plate <- as.integer(input$plate_size)
-    guessed <- file_obj$guessed_plate
+    guessed <- obj$guessed_plate
     
     cat("Selected plate size:", sel_plate, "\n")
-    cat("Guessed plate size from file wells:", ifelse(is.na(guessed), "NA", guessed), "\n\n")
+    cat("Guessed plate size from file wells:", ifelse(is.na(guessed), "NA", guessed), "\n")
+    cat("Dataset key:", input$merged_file, "\n")
+    cat("Original file:", obj$original_filename, "\n\n")
     
-    wells_in_file <- unique(file_obj$wells)
+    wells_in_file <- unique(obj$wells)
     wells_in_pm <- pm$Well
     
     cat("File wells (normalized):", length(wells_in_file), "\n")
@@ -627,8 +689,7 @@ server <- function(input, output, session) {
   })
   
   output$merged_preview <- renderTable({
-    m <- merged_data()
-    utils::head(m, 20)
+    utils::head(merged_data(), 20)
   }, striped = TRUE, bordered = TRUE, spacing = "s")
 }
 
