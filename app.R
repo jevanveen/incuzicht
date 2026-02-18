@@ -1,11 +1,13 @@
 # app.R
 # Incucyte Multi-File Import + Channel Normalization (Passage as surrogate BioRep)
-# + Condition header parser -> receptor + treatment factors
-# + Prism export (wide): elapsed in rows; biological replicates (Passage) stacked in columns
-#   organized first by receptor then treatment.
+# + Condition header parser -> receptor + treatment factors (defaults: receptor="none", treatment="VEH")
+# + Prism export (wide, 1 row per elapsed): elapsed in rows; columns = receptor/treatment/passages
+#   organized first by receptor then by treatment, replicates stacked by Passage.
+# + Plot defaults: facet by Passage; color by receptor.
 
 library(shiny)
 library(tidyverse)
+libraryreadr <- readr::read_delim
 library(readr)
 library(stringr)
 
@@ -28,10 +30,8 @@ extract_key_value <- function(lines, key) {
 
 read_incucyte_header_meta <- function(path) {
   lines <- readLines(path, warn = FALSE)
-  
   header_i <- find_data_header_row(lines)
   if (is.na(header_i)) stop("Couldn't find data header row starting with 'Date Time<TAB>Elapsed'.")
-  
   meta_lines <- lines[1:(header_i - 1)]
   tibble(
     vessel_name = extract_key_value(meta_lines, "Vessel Name"),
@@ -48,7 +48,6 @@ read_incucyte_header_meta <- function(path) {
 # ---------------------------
 read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
   lines <- readLines(path, warn = FALSE)
-  
   header_i <- find_data_header_row(lines)
   if (is.na(header_i)) stop("Couldn't find header row starting with 'Date Time<TAB>Elapsed'.")
   
@@ -84,9 +83,9 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
 
 # ---------------------------
 # Condition header parsing: receptor + treatment factors
-# Defaults requested:
-# - receptor default: "none"
-# - treatment default: "VEH"
+# Defaults:
+# - receptor: "none"
+# - treatment: "VEH"
 # ---------------------------
 canonicalize_receptor_token <- function(x) {
   z <- x %>%
@@ -96,7 +95,7 @@ canonicalize_receptor_token <- function(x) {
     str_replace_all("[^a-z0-9\\s]", " ") %>%
     str_squish()
   
-  dplyr::case_when(
+  case_when(
     z %in% c("era", "er a", "esr1", "er1") ~ "era",
     z %in% c("erb", "er b", "esr2", "er2") ~ "erb",
     z %in% c("pgr", "pr", "prg") ~ "pgr",
@@ -112,22 +111,18 @@ is_vehicle_token <- function(x) {
   z %in% c("veh", "vehicle", "etoh", "ethanol", "dmso", "pbs", "media", "control")
 }
 
-# Matches: 30nM E2, 250 nM P4, 1uM DHT, 10 pM E2, etc.
 parse_treatment_token <- function(x) {
   z <- str_squish(x)
-  
   m <- str_match(
     z,
     regex("^\\s*([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\s*([a-z0-9\\-]+)\\s*$",
           ignore_case = TRUE)
   )
   if (all(is.na(m))) return(NA_character_)
-  
   amount <- m[, 2]
   unit   <- toupper(m[, 3])
   unit   <- ifelse(unit == "µM", "uM", unit)
   comp   <- toupper(m[, 4])
-  
   paste0(amount, unit, " ", comp)
 }
 
@@ -159,15 +154,15 @@ guess_receptor_treatment <- function(condition_vec) {
         conc_parsed <- purrr::map_chr(non_receptor, parse_treatment_token)
         conc_idx <- !is.na(conc_parsed)
         
-        treatment <- dplyr::case_when(
+        treatment <- case_when(
           any(conc_idx) ~ paste(unique(conc_parsed[conc_idx]), collapse = " + "),
           any(veh_idx) ~ "VEH",
-          length(non_receptor) == 0 ~ "VEH",        # <-- default treatment
+          length(non_receptor) == 0 ~ "VEH",
           TRUE ~ paste(non_receptor, collapse = " + ")
         )
         
         list(
-          receptor = canonicalize_receptor_combo(receptors), # <-- default receptor = "none"
+          receptor = canonicalize_receptor_combo(receptors),
           treatment = treatment
         )
       })
@@ -208,7 +203,7 @@ ui <- fluidPage(
     ),
     mainPanel(
       tabsetPanel(
-        tabPanel("Plot", plotOutput("plot", height = 420)),
+        tabPanel("Plot", plotOutput("plot", height = 460)),
         tabPanel("Join checks", verbatimTextOutput("join_checks")),
         tabPanel("Raw (tidy long)", tableOutput("preview_long")),
         tabPanel("Joined (wide by channel)", tableOutput("preview_wide")),
@@ -342,7 +337,6 @@ server <- function(input, output, session) {
     
     dat %>%
       left_join(annot, by = c("condition" = "condition_raw")) %>%
-      # ensure defaults are applied even if join fails for some reason
       mutate(
         receptor = fct_explicit_na(receptor, na_level = "none"),
         treatment = fct_explicit_na(treatment, na_level = "VEH")
@@ -378,8 +372,8 @@ server <- function(input, output, session) {
         n_conditions = n_distinct(condition),
         receptor_levels = paste(levels(receptor), collapse = ", "),
         treatment_levels = paste(levels(treatment), collapse = ", "),
-        n_receptor_missing = sum(is.na(receptor)),
-        n_treatment_missing = sum(is.na(treatment))
+        receptor_none_frac = mean(as.character(receptor) == "none", na.rm = TRUE),
+        treatment_veh_frac = mean(as.character(treatment) == "VEH", na.rm = TRUE)
       )
     
     list(
@@ -465,31 +459,27 @@ server <- function(input, output, session) {
   })
   
   # Prism export:
-  # - elapsed in rows
-  # - columns = biological replicates (Passage) stacked next to each other
-  # - organized first by receptor then treatment
-  #
-  # Column naming: "<receptor>__<treatment>__<passage>"
+  # Requirement: ONE ROW PER TIMEPOINT (elapsed).
+  # So we must collapse across condition within each receptor/treatment/passsage, OR choose a single condition.
+  # Here we collapse by MEAN across all conditions that map to the same receptor+treatment within a passage at each time.
+  # If you prefer "one condition only" (e.g., keep condition as separate exports), we can change this.
   prism_wide <- reactive({
     req(stats_long())
     df <- stats_long() %>%
-      # One value per (elapsed, receptor, treatment, passage)
       group_by(elapsed, receptor, treatment, passage) %>%
       summarize(value = mean(value_norm, na.rm = TRUE), .groups = "drop") %>%
       mutate(col_key = paste(receptor, treatment, passage, sep = "__"))
     
     wide <- df %>%
-      select(elapsed, receptor, treatment, passage, col_key, value) %>%
+      select(elapsed, col_key, value) %>%
       pivot_wider(names_from = col_key, values_from = value)
     
-    # Reorder columns: elapsed first, then by receptor, then treatment, then passage
+    # order columns: receptor -> treatment -> passage
     col_meta <- df %>%
       distinct(col_key, receptor, treatment, passage) %>%
       arrange(receptor, treatment, passage)
     
-    ordered_cols <- c("elapsed", col_meta$col_key)
-    wide %>%
-      select(any_of(ordered_cols))
+    wide %>% select(elapsed, any_of(col_meta$col_key))
   })
   
   output$preview_prism <- renderTable({
@@ -497,7 +487,7 @@ server <- function(input, output, session) {
     head(prism_wide(), 20)
   })
   
-  # Plot: thin lines = each Passage trajectory; thick line = mean across Passage
+  # Plot defaults: facet by Passage; color by receptor
   output$plot <- renderPlot({
     req(stats_long())
     df <- stats_long()
@@ -508,17 +498,14 @@ server <- function(input, output, session) {
       return()
     }
     
-    mean_df <- df %>%
-      group_by(elapsed, condition, receptor, treatment) %>%
-      summarize(mean = mean(value_norm, na.rm = TRUE), .groups = "drop")
-    
-    ggplot(df, aes(x = elapsed, y = value_norm, group = interaction(passage, condition))) +
-      geom_line(alpha = 0.35) +
-      geom_line(data = mean_df, aes(y = mean, group = condition), linewidth = 1.0) +
+    # show trajectories per condition; color by receptor; facet by passage
+    ggplot(df, aes(x = elapsed, y = value_norm, group = condition, color = receptor)) +
+      geom_line(alpha = 0.6) +
+      facet_wrap(~ passage) +
       labs(
         x = "Elapsed time",
         y = "Value (normalized)",
-        title = "Normalized trajectories by Passage (thin) + mean across Passage (thick)"
+        title = "Normalized trajectories (facet by Passage; color by receptor)"
       ) +
       theme_minimal()
   })
@@ -559,7 +546,7 @@ server <- function(input, output, session) {
   )
   
   output$download_prism <- downloadHandler(
-    filename = function() paste0("incucyte_prism_wide_", Sys.Date(), ".csv"),
+    filename = function() paste0("incucyte_prism_wide_1row_per_time_", Sys.Date(), ".csv"),
     content = function(file) {
       req(prism_wide())
       write_csv(prism_wide(), file)
