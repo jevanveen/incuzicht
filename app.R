@@ -1,15 +1,8 @@
 # app.R
 # Incucyte Multi-File Import + Channel Normalization (Passage as surrogate BioRep)
 # + Condition header parser -> receptor + treatment factors
-#
-# Features:
-# - Imports Incucyte "wide-by-condition" exports (header line: "Date Time<TAB>Elapsed...")
-# - Per-file channel assignment; default: if filename contains "red" anywhere -> NIR
-# - Passage parsed from file header and stored as factor (surrogate biological replicate)
-# - Normalization within Passage (ratio or log2 ratio; optional baseline normalize)
-# - Adds receptor + treatment factors guessed from condition headers
-# - Plot tab left of Join checks
-# - Downloads: tidy long, joined wide, normalized, stats-ready long
+# + Prism export (wide): elapsed in rows; biological replicates (Passage) stacked in columns
+#   organized first by receptor then treatment.
 
 library(shiny)
 library(tidyverse)
@@ -91,8 +84,10 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
 
 # ---------------------------
 # Condition header parsing: receptor + treatment factors
+# Defaults requested:
+# - receptor default: "none"
+# - treatment default: "VEH"
 # ---------------------------
-
 canonicalize_receptor_token <- function(x) {
   z <- x %>%
     str_to_lower() %>%
@@ -105,8 +100,8 @@ canonicalize_receptor_token <- function(x) {
     z %in% c("era", "er a", "esr1", "er1") ~ "era",
     z %in% c("erb", "er b", "esr2", "er2") ~ "erb",
     z %in% c("pgr", "pr", "prg") ~ "pgr",
-    z %in% c("pra", "pr a", "pr a isoform", "pr a iso", "pr-a", "pr a iso") ~ "pra",
-    z %in% c("prb", "pr b", "pr b isoform", "pr b iso", "pr-b", "pr b iso") ~ "prb",
+    z %in% c("pra", "pr a", "pr-a", "pr a isoform", "pr a iso") ~ "pra",
+    z %in% c("prb", "pr b", "pr-b", "pr b isoform", "pr b iso") ~ "prb",
     z %in% c("gr", "nr3c1", "glucocorticoid receptor") ~ "gr",
     TRUE ~ NA_character_
   )
@@ -117,6 +112,7 @@ is_vehicle_token <- function(x) {
   z %in% c("veh", "vehicle", "etoh", "ethanol", "dmso", "pbs", "media", "control")
 }
 
+# Matches: 30nM E2, 250 nM P4, 1uM DHT, 10 pM E2, etc.
 parse_treatment_token <- function(x) {
   z <- str_squish(x)
   
@@ -138,7 +134,7 @@ parse_treatment_token <- function(x) {
 canonicalize_receptor_combo <- function(receptors) {
   order <- c("era", "erb", "pgr", "pra", "prb", "gr")
   recs <- unique(na.omit(receptors))
-  if (length(recs) == 0) return(NA_character_)
+  if (length(recs) == 0) return("none")
   recs <- recs[order(match(recs, order, nomatch = 999))]
   paste(recs, collapse = " + ")
 }
@@ -166,12 +162,12 @@ guess_receptor_treatment <- function(condition_vec) {
         treatment <- dplyr::case_when(
           any(conc_idx) ~ paste(unique(conc_parsed[conc_idx]), collapse = " + "),
           any(veh_idx) ~ "VEH",
-          length(non_receptor) == 0 ~ NA_character_,
+          length(non_receptor) == 0 ~ "VEH",        # <-- default treatment
           TRUE ~ paste(non_receptor, collapse = " + ")
         )
         
         list(
-          receptor = canonicalize_receptor_combo(receptors),
+          receptor = canonicalize_receptor_combo(receptors), # <-- default receptor = "none"
           treatment = treatment
         )
       })
@@ -188,7 +184,7 @@ guess_receptor_treatment <- function(condition_vec) {
 # UI
 # ---------------------------
 ui <- fluidPage(
-  titlePanel("Incucyte Multi-File Import + Channel Normalization (Passage + receptor/treatment parsing)"),
+  titlePanel("Incucyte Multi-File Import + Channel Normalization (Passage + receptor/treatment + Prism export)"),
   sidebarLayout(
     sidebarPanel(
       fileInput(
@@ -203,10 +199,12 @@ ui <- fluidPage(
       uiOutput("norm_ui"),
       actionButton("run", "Import + Process", class = "btn-primary"),
       hr(),
-      downloadButton("download_long", "Download: tidy long (csv)"),
-      downloadButton("download_wide", "Download: joined wide (csv)"),
-      downloadButton("download_norm", "Download: normalized (csv)"),
-      downloadButton("download_stats", "Download: stats-ready long (csv)")
+      h4("Downloads"),
+      downloadButton("download_long", "Tidy long (csv)"),
+      downloadButton("download_wide", "Joined wide by Passage (csv)"),
+      downloadButton("download_norm", "Normalized by Passage (csv)"),
+      downloadButton("download_stats", "Stats-ready long (csv)"),
+      downloadButton("download_prism", "Prism wide export (csv)")
     ),
     mainPanel(
       tabsetPanel(
@@ -215,7 +213,8 @@ ui <- fluidPage(
         tabPanel("Raw (tidy long)", tableOutput("preview_long")),
         tabPanel("Joined (wide by channel)", tableOutput("preview_wide")),
         tabPanel("Normalized", tableOutput("preview_norm")),
-        tabPanel("Stats-ready", tableOutput("preview_stats"))
+        tabPanel("Stats-ready", tableOutput("preview_stats")),
+        tabPanel("Prism preview", tableOutput("preview_prism"))
       )
     )
   )
@@ -226,7 +225,6 @@ ui <- fluidPage(
 # ---------------------------
 server <- function(input, output, session) {
   
-  # Dynamic UI: per-file channel assignment
   output$channel_map_ui <- renderUI({
     req(input$files)
     fns <- input$files$name
@@ -259,7 +257,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # Safe getter for dynamic inputs
   channel_map <- reactive({
     req(input$files)
     fns <- input$files$name
@@ -284,7 +281,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # Normalization UI
   output$norm_ui <- renderUI({
     req(channel_map())
     chans <- sort(unique(channel_map()$channel))
@@ -317,7 +313,7 @@ server <- function(input, output, session) {
     )
   })
   
-  # Import all files to tidy long + parse header metadata (incl Passage) + add receptor/treatment
+  # Import + add receptor/treatment
   raw_long <- eventReactive(input$run, {
     cm <- channel_map()
     
@@ -342,10 +338,15 @@ server <- function(input, output, session) {
       select(file, channel, passage, vessel_name, metric, cell_type, analysis,
              datetime, elapsed, condition, value)
     
-    # Add receptor/treatment factors based on condition headers
     annot <- guess_receptor_treatment(unique(dat$condition))
+    
     dat %>%
       left_join(annot, by = c("condition" = "condition_raw")) %>%
+      # ensure defaults are applied even if join fails for some reason
+      mutate(
+        receptor = fct_explicit_na(receptor, na_level = "none"),
+        treatment = fct_explicit_na(treatment, na_level = "VEH")
+      ) %>%
       relocate(receptor, treatment, .after = condition)
   }, ignoreInit = TRUE)
   
@@ -354,7 +355,6 @@ server <- function(input, output, session) {
     head(raw_long(), 20)
   })
   
-  # Join checks
   output$join_checks <- renderPrint({
     req(raw_long())
     rl <- raw_long()
@@ -373,10 +373,11 @@ server <- function(input, output, session) {
         .groups = "drop"
       )
     
-    # parsing coverage
     parse_cov <- rl %>%
       summarize(
         n_conditions = n_distinct(condition),
+        receptor_levels = paste(levels(receptor), collapse = ", "),
+        treatment_levels = paste(levels(treatment), collapse = ", "),
         n_receptor_missing = sum(is.na(receptor)),
         n_treatment_missing = sum(is.na(treatment))
       )
@@ -385,7 +386,7 @@ server <- function(input, output, session) {
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
       parsing_coverage = parse_cov,
-      note = "Passage parsed from file header line 'Passage: <n>' and stored as factor surrogate biological replicate."
+      note = "Defaults: receptor='none' if no receptor token found; treatment='VEH' if no treatment token found."
     )
   })
   
@@ -446,17 +447,54 @@ server <- function(input, output, session) {
     head(normalized_passage(), 20)
   })
   
-  # Stats-ready long table: (Passage surrogate replicate, receptor, treatment, condition, time)
+  # Stats-ready long table
   stats_long <- reactive({
     req(normalized_passage())
     normalized_passage() %>%
+      mutate(
+        receptor = fct_explicit_na(receptor, na_level = "none"),
+        treatment = fct_explicit_na(treatment, na_level = "VEH")
+      ) %>%
       select(passage, elapsed, condition, receptor, treatment, value_norm) %>%
-      arrange(passage, receptor, treatment, condition, elapsed)
+      arrange(receptor, treatment, passage, condition, elapsed)
   })
   
   output$preview_stats <- renderTable({
     req(stats_long())
     head(stats_long(), 20)
+  })
+  
+  # Prism export:
+  # - elapsed in rows
+  # - columns = biological replicates (Passage) stacked next to each other
+  # - organized first by receptor then treatment
+  #
+  # Column naming: "<receptor>__<treatment>__<passage>"
+  prism_wide <- reactive({
+    req(stats_long())
+    df <- stats_long() %>%
+      # One value per (elapsed, receptor, treatment, passage)
+      group_by(elapsed, receptor, treatment, passage) %>%
+      summarize(value = mean(value_norm, na.rm = TRUE), .groups = "drop") %>%
+      mutate(col_key = paste(receptor, treatment, passage, sep = "__"))
+    
+    wide <- df %>%
+      select(elapsed, receptor, treatment, passage, col_key, value) %>%
+      pivot_wider(names_from = col_key, values_from = value)
+    
+    # Reorder columns: elapsed first, then by receptor, then treatment, then passage
+    col_meta <- df %>%
+      distinct(col_key, receptor, treatment, passage) %>%
+      arrange(receptor, treatment, passage)
+    
+    ordered_cols <- c("elapsed", col_meta$col_key)
+    wide %>%
+      select(any_of(ordered_cols))
+  })
+  
+  output$preview_prism <- renderTable({
+    req(prism_wide())
+    head(prism_wide(), 20)
   })
   
   # Plot: thin lines = each Passage trajectory; thick line = mean across Passage
@@ -517,6 +555,14 @@ server <- function(input, output, session) {
     content = function(file) {
       req(stats_long())
       write_csv(stats_long(), file)
+    }
+  )
+  
+  output$download_prism <- downloadHandler(
+    filename = function() paste0("incucyte_prism_wide_", Sys.Date(), ".csv"),
+    content = function(file) {
+      req(prism_wide())
+      write_csv(prism_wide(), file)
     }
   )
 }
