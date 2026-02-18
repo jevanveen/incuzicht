@@ -1,11 +1,15 @@
 # app.R
-# Incucyte Multi-File Import + Channel Normalization
-# - Works with "wide-by-condition" Incucyte exports like your exp97.1_greenintensity_data.txt
-#   (metadata header lines; real header begins with: "Date Time<TAB>Elapsed<...conditions...>")
-# - Per-file channel assignment (defaults: if filename contains "red" -> NIR)
-# - Normalization (signal/control) computed *within Passage* (Passage parsed from file header)
-# - Plot tab is left of Join checks
-# - Stores Passage as factor as surrogate biological replicate for stats
+# Incucyte Multi-File Import + Channel Normalization (Passage as surrogate BioRep)
+# + Condition header parser -> receptor + treatment factors
+#
+# Features:
+# - Imports Incucyte "wide-by-condition" exports (header line: "Date Time<TAB>Elapsed...")
+# - Per-file channel assignment; default: if filename contains "red" anywhere -> NIR
+# - Passage parsed from file header and stored as factor (surrogate biological replicate)
+# - Normalization within Passage (ratio or log2 ratio; optional baseline normalize)
+# - Adds receptor + treatment factors guessed from condition headers
+# - Plot tab left of Join checks
+# - Downloads: tidy long, joined wide, normalized, stats-ready long
 
 library(shiny)
 library(tidyverse)
@@ -15,7 +19,6 @@ library(stringr)
 # ---------------------------
 # Helpers: parse Incucyte header metadata
 # ---------------------------
-
 find_data_header_row <- function(lines) {
   idx <- which(str_detect(lines, "^Date Time\\tElapsed\\b"))
   if (length(idx) == 0) return(NA_integer_)
@@ -23,11 +26,10 @@ find_data_header_row <- function(lines) {
 }
 
 extract_key_value <- function(lines, key) {
-  # matches e.g. "Passage: 13"
   pat <- paste0("^", stringr::fixed(key), "\\s*:\\s*(.*)$")
   hit <- lines[str_detect(lines, pat)]
   if (length(hit) == 0) return(NA_character_)
-  val <- str_match(hit[1], pat)[,2]
+  val <- str_match(hit[1], pat)[, 2]
   if (is.na(val)) NA_character_ else str_trim(val)
 }
 
@@ -35,9 +37,7 @@ read_incucyte_header_meta <- function(path) {
   lines <- readLines(path, warn = FALSE)
   
   header_i <- find_data_header_row(lines)
-  if (is.na(header_i)) {
-    stop("Couldn't find data header row starting with 'Date Time<TAB>Elapsed'.")
-  }
+  if (is.na(header_i)) stop("Couldn't find data header row starting with 'Date Time<TAB>Elapsed'.")
   
   meta_lines <- lines[1:(header_i - 1)]
   tibble(
@@ -53,14 +53,11 @@ read_incucyte_header_meta <- function(path) {
 # ---------------------------
 # Reader: Incucyte wide-by-condition export -> tidy long
 # ---------------------------
-
 read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
   lines <- readLines(path, warn = FALSE)
   
   header_i <- find_data_header_row(lines)
-  if (is.na(header_i)) {
-    stop("Couldn't find header row starting with 'Date Time<TAB>Elapsed'.")
-  }
+  if (is.na(header_i)) stop("Couldn't find header row starting with 'Date Time<TAB>Elapsed'.")
   
   txt <- paste(lines[header_i:length(lines)], collapse = "\n")
   
@@ -74,9 +71,7 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
   if (ncol(dat) < 3) stop("Parsed <3 columns. Is this the right Incucyte export format?")
   names(dat)[1:2] <- c("datetime", "elapsed")
   
-  if (drop_stderr) {
-    dat <- dat %>% select(-matches("\\(Std Err"))
-  }
+  if (drop_stderr) dat <- dat %>% select(-matches("\\(Std Err"))
   
   dat %>%
     mutate(
@@ -95,11 +90,105 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
 }
 
 # ---------------------------
-# UI
+# Condition header parsing: receptor + treatment factors
 # ---------------------------
 
+canonicalize_receptor_token <- function(x) {
+  z <- x %>%
+    str_to_lower() %>%
+    str_replace_all("[α]", "a") %>%
+    str_replace_all("[β]", "b") %>%
+    str_replace_all("[^a-z0-9\\s]", " ") %>%
+    str_squish()
+  
+  dplyr::case_when(
+    z %in% c("era", "er a", "esr1", "er1") ~ "era",
+    z %in% c("erb", "er b", "esr2", "er2") ~ "erb",
+    z %in% c("pgr", "pr", "prg") ~ "pgr",
+    z %in% c("pra", "pr a", "pr a isoform", "pr a iso", "pr-a", "pr a iso") ~ "pra",
+    z %in% c("prb", "pr b", "pr b isoform", "pr b iso", "pr-b", "pr b iso") ~ "prb",
+    z %in% c("gr", "nr3c1", "glucocorticoid receptor") ~ "gr",
+    TRUE ~ NA_character_
+  )
+}
+
+is_vehicle_token <- function(x) {
+  z <- str_to_lower(str_squish(x))
+  z %in% c("veh", "vehicle", "etoh", "ethanol", "dmso", "pbs", "media", "control")
+}
+
+parse_treatment_token <- function(x) {
+  z <- str_squish(x)
+  
+  m <- str_match(
+    z,
+    regex("^\\s*([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\s*([a-z0-9\\-]+)\\s*$",
+          ignore_case = TRUE)
+  )
+  if (all(is.na(m))) return(NA_character_)
+  
+  amount <- m[, 2]
+  unit   <- toupper(m[, 3])
+  unit   <- ifelse(unit == "µM", "uM", unit)
+  comp   <- toupper(m[, 4])
+  
+  paste0(amount, unit, " ", comp)
+}
+
+canonicalize_receptor_combo <- function(receptors) {
+  order <- c("era", "erb", "pgr", "pra", "prb", "gr")
+  recs <- unique(na.omit(receptors))
+  if (length(recs) == 0) return(NA_character_)
+  recs <- recs[order(match(recs, order, nomatch = 999))]
+  paste(recs, collapse = " + ")
+}
+
+guess_receptor_treatment <- function(condition_vec) {
+  tibble(condition_raw = condition_vec) %>%
+    mutate(
+      condition_norm = condition_raw %>%
+        str_replace_all("\\s*\\+\\s*", " + ") %>%
+        str_squish(),
+      tokens = str_split(condition_norm, " \\+ ")
+    ) %>%
+    mutate(
+      parsed = purrr::map(tokens, function(tok) {
+        tok <- str_squish(tok)
+        
+        receptor_tokens <- purrr::map_chr(tok, canonicalize_receptor_token)
+        receptors <- receptor_tokens[!is.na(receptor_tokens)]
+        non_receptor <- tok[is.na(receptor_tokens)]
+        
+        veh_idx <- purrr::map_lgl(non_receptor, is_vehicle_token)
+        conc_parsed <- purrr::map_chr(non_receptor, parse_treatment_token)
+        conc_idx <- !is.na(conc_parsed)
+        
+        treatment <- dplyr::case_when(
+          any(conc_idx) ~ paste(unique(conc_parsed[conc_idx]), collapse = " + "),
+          any(veh_idx) ~ "VEH",
+          length(non_receptor) == 0 ~ NA_character_,
+          TRUE ~ paste(non_receptor, collapse = " + ")
+        )
+        
+        list(
+          receptor = canonicalize_receptor_combo(receptors),
+          treatment = treatment
+        )
+      })
+    ) %>%
+    tidyr::unnest_wider(parsed) %>%
+    mutate(
+      receptor = factor(receptor),
+      treatment = factor(treatment)
+    ) %>%
+    select(condition_raw, receptor, treatment)
+}
+
+# ---------------------------
+# UI
+# ---------------------------
 ui <- fluidPage(
-  titlePanel("Incucyte Multi-File Import + Channel Normalization (Passage = BioRep surrogate)"),
+  titlePanel("Incucyte Multi-File Import + Channel Normalization (Passage + receptor/treatment parsing)"),
   sidebarLayout(
     sidebarPanel(
       fileInput(
@@ -135,7 +224,6 @@ ui <- fluidPage(
 # ---------------------------
 # Server
 # ---------------------------
-
 server <- function(input, output, session) {
   
   # Dynamic UI: per-file channel assignment
@@ -149,7 +237,6 @@ server <- function(input, output, session) {
       lapply(seq_along(fns), function(i) {
         fname <- fns[i]
         
-        # IMPORTANT: check "red" first -> NIR (per your request)
         default <- if (str_detect(tolower(fname), "red")) "NIR" else
           if (str_detect(tolower(fname), "nir")) "NIR" else
             if (str_detect(tolower(fname), "gfp|green")) "GFP" else
@@ -181,7 +268,6 @@ server <- function(input, output, session) {
       id <- paste0("chan_", i)
       val <- input[[id]]
       if (is.null(val) || length(val) == 0 || is.na(val) || val == "") {
-        # fallback defaults (same logic)
         if (str_detect(tolower(fname), "red")) return("NIR")
         if (str_detect(tolower(fname), "nir")) return("NIR")
         if (str_detect(tolower(fname), "gfp|green")) return("GFP")
@@ -194,11 +280,11 @@ server <- function(input, output, session) {
     tibble(
       file = fns,
       path = input$files$datapath,
-      channel = map_chr(seq_along(fns), ~ get_chan(.x, fns[.x]))
+      channel = purrr::map_chr(seq_along(fns), ~ get_chan(.x, fns[.x]))
     )
   })
   
-  # Normalization UI (appears once channels are known)
+  # Normalization UI
   output$norm_ui <- renderUI({
     req(channel_map())
     chans <- sort(unique(channel_map()$channel))
@@ -231,19 +317,18 @@ server <- function(input, output, session) {
     )
   })
   
-  # Import all files to tidy long + header metadata (incl Passage)
+  # Import all files to tidy long + parse header metadata (incl Passage) + add receptor/treatment
   raw_long <- eventReactive(input$run, {
     cm <- channel_map()
     
-    purrr::pmap_dfr(cm, function(file, path, channel) {
-      meta <- read_incucyte_header_meta(path)  # passage, vessel_name, etc.
-      dat  <- read_incucyte_wide_conditions(path, drop_stderr = isTRUE(input$drop_stderr))
+    dat <- purrr::pmap_dfr(cm, function(file, path, channel) {
+      meta <- read_incucyte_header_meta(path)
+      dat0 <- read_incucyte_wide_conditions(path, drop_stderr = isTRUE(input$drop_stderr))
       
       passage_chr <- meta$passage[[1]]
-      # store as factor label like "Passage_13" (handles NA gracefully)
       passage_lab <- if (!is.na(passage_chr) && passage_chr != "") paste0("Passage_", passage_chr) else "Passage_NA"
       
-      dat %>%
+      dat0 %>%
         mutate(
           file = file,
           channel = channel,
@@ -256,6 +341,12 @@ server <- function(input, output, session) {
     }) %>%
       select(file, channel, passage, vessel_name, metric, cell_type, analysis,
              datetime, elapsed, condition, value)
+    
+    # Add receptor/treatment factors based on condition headers
+    annot <- guess_receptor_treatment(unique(dat$condition))
+    dat %>%
+      left_join(annot, by = c("condition" = "condition_raw")) %>%
+      relocate(receptor, treatment, .after = condition)
   }, ignoreInit = TRUE)
   
   output$preview_long <- renderTable({
@@ -263,60 +354,47 @@ server <- function(input, output, session) {
     head(raw_long(), 20)
   })
   
-  # Join checks summary
+  # Join checks
   output$join_checks <- renderPrint({
     req(raw_long())
     rl <- raw_long()
     
-    per_file <- rl %>%
-      distinct(file, channel, passage, vessel_name, metric, cell_type, analysis)
+    files_loaded <- rl %>%
+      distinct(file, channel, passage, vessel_name, metric, cell_type, analysis) %>%
+      arrange(passage, channel, file)
     
-    by_chan <- rl %>%
+    per_channel <- rl %>%
       group_by(channel) %>%
       summarize(
         n_rows = n(),
         n_passages = n_distinct(passage),
         n_conditions = n_distinct(condition),
         n_times = n_distinct(elapsed),
-        min_time = suppressWarnings(min(elapsed, na.rm = TRUE)),
-        max_time = suppressWarnings(max(elapsed, na.rm = TRUE)),
         .groups = "drop"
       )
     
-    # pairwise condition overlap between channels (global)
-    chans <- sort(unique(rl$channel))
-    conds_by <- split(unique(rl$condition), rl$channel)
-    
-    pairwise <- tibble()
-    if (length(chans) >= 2) {
-      pairwise <- purrr::map_dfr(combn(chans, 2, simplify = FALSE), function(pair) {
-        a <- pair[1]; b <- pair[2]
-        ia <- conds_by[[a]] %||% character()
-        ib <- conds_by[[b]] %||% character()
-        tibble(
-          channel_a = a,
-          channel_b = b,
-          conditions_in_a_not_b = length(setdiff(ia, ib)),
-          conditions_in_b_not_a = length(setdiff(ib, ia)),
-          conditions_in_both = length(intersect(ia, ib))
-        )
-      })
-    }
+    # parsing coverage
+    parse_cov <- rl %>%
+      summarize(
+        n_conditions = n_distinct(condition),
+        n_receptor_missing = sum(is.na(receptor)),
+        n_treatment_missing = sum(is.na(treatment))
+      )
     
     list(
-      files_loaded = per_file,
-      per_channel_summary = by_chan,
-      pairwise_condition_overlap = pairwise,
-      note = "Passage is parsed from file header line 'Passage: <n>' and stored as a factor surrogate for biological replicate."
+      files_loaded = files_loaded,
+      per_channel_summary = per_channel,
+      parsing_coverage = parse_cov,
+      note = "Passage parsed from file header line 'Passage: <n>' and stored as factor surrogate biological replicate."
     )
   })
   
-  # Wide join WITHIN Passage (key for stats)
+  # Wide join WITHIN Passage (stats-friendly)
   wide_joined_passage <- reactive({
     req(raw_long())
     raw_long() %>%
-      select(passage, channel, elapsed, condition, value) %>%
-      group_by(passage, channel, elapsed, condition) %>%
+      select(passage, channel, elapsed, condition, receptor, treatment, value) %>%
+      group_by(passage, channel, elapsed, condition, receptor, treatment) %>%
       summarize(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
       pivot_wider(names_from = channel, values_from = value)
   })
@@ -368,12 +446,12 @@ server <- function(input, output, session) {
     head(normalized_passage(), 20)
   })
   
-  # Stats-ready long table: one row per (Passage, Condition, Time)
+  # Stats-ready long table: (Passage surrogate replicate, receptor, treatment, condition, time)
   stats_long <- reactive({
     req(normalized_passage())
     normalized_passage() %>%
-      select(passage, elapsed, condition, value_norm) %>%
-      arrange(passage, condition, elapsed)
+      select(passage, elapsed, condition, receptor, treatment, value_norm) %>%
+      arrange(passage, receptor, treatment, condition, elapsed)
   })
   
   output$preview_stats <- renderTable({
@@ -381,9 +459,7 @@ server <- function(input, output, session) {
     head(stats_long(), 20)
   })
   
-  # Plot:
-  # - thin lines = each Passage trajectory (surrogate biological replicate)
-  # - thick line = mean across Passage
+  # Plot: thin lines = each Passage trajectory; thick line = mean across Passage
   output$plot <- renderPlot({
     req(stats_long())
     df <- stats_long()
@@ -395,7 +471,7 @@ server <- function(input, output, session) {
     }
     
     mean_df <- df %>%
-      group_by(elapsed, condition) %>%
+      group_by(elapsed, condition, receptor, treatment) %>%
       summarize(mean = mean(value_norm, na.rm = TRUE), .groups = "drop")
     
     ggplot(df, aes(x = elapsed, y = value_norm, group = interaction(passage, condition))) +
