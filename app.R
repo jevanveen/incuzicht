@@ -5,7 +5,7 @@
 #   organized first by receptor then by treatment, replicates stacked by Passage.
 # + Plot defaults: facet by Passage; color by receptor.
 # + Tabs: Plot, Join checks, File preview, Normalized, Prism preview
-# + Normalization methods: None, Ratio, Log2 ratio, OLS-adjusted (residuals)
+# + Normalization methods: None, Ratio, Log2 ratio, OLS-adjusted (control-adjusted signal)
 
 library(shiny)
 library(tidyverse)
@@ -185,25 +185,30 @@ preview_file_lines <- function(path, n = 10) {
 }
 
 # ---------------------------
-# OLS normalization helper (residualize signal on control)
-# computed within Passage + Condition across timepoints
+# OLS normalization helper: control-adjusted signal
+# computed within Passage + Condition across timepoints:
+#   fit: signal = a + b*control
+#   adjusted: signal_adj = signal - b*(control - mean(control))
+# (keeps signal scale; corrects for control fluctuations)
 # ---------------------------
-ols_residualize <- function(df, sig_col, ctl_col) {
+ols_control_adjust <- function(df, sig_col, ctl_col) {
   x <- df[[ctl_col]]
   y <- df[[sig_col]]
   ok <- is.finite(x) & is.finite(y)
   
-  # need at least 3 paired points to fit reliably
   if (sum(ok) < 3) {
     df$value_norm <- NA_real_
     return(df)
   }
   
   fit <- stats::lm(y[ok] ~ x[ok])
-  res <- rep(NA_real_, length(y))
-  res[ok] <- stats::residuals(fit)
+  b <- unname(stats::coef(fit)[2])
+  xbar <- mean(x[ok], na.rm = TRUE)
   
-  df$value_norm <- res
+  adj <- rep(NA_real_, length(y))
+  adj[ok] <- y[ok] - b * (x[ok] - xbar)
+  
+  df$value_norm <- adj
   df
 }
 
@@ -337,7 +342,7 @@ server <- function(input, output, session) {
           "None (keep raw signal channel)" = "none",
           "Ratio (signal/control)" = "ratio",
           "Log2 ratio (log2(signal/control))" = "log2ratio",
-          "OLS-adjusted (residuals of signal ~ control)" = "ols_resid"
+          "OLS-adjusted (control-adjusted signal)" = "ols_adj"
         ),
         selected = "ratio"
       ),
@@ -455,11 +460,11 @@ server <- function(input, output, session) {
             TRUE ~ NA_real_
           )
         )
-    } else if (method == "ols_resid") {
-      # residualize within Passage + Condition across timepoints
+    } else if (method == "ols_adj") {
+      # control-adjust within Passage + Condition across timepoints
       out <- out %>%
         group_by(passage, condition) %>%
-        group_modify(~ ols_residualize(.x, sig_col = sig, ctl_col = ctl)) %>%
+        group_modify(~ ols_control_adjust(.x, sig_col = sig, ctl_col = ctl)) %>%
         ungroup()
     } else {
       out <- out %>% mutate(value_norm = NA_real_)
