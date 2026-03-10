@@ -1,10 +1,11 @@
 # app.R
 # Incucyte Multi-File Import + Channel Normalization (Passage as surrogate BioRep)
 # + Condition header parser -> receptor + treatment factors (defaults: receptor="none", treatment="VEH")
+# + Editable factor assignments tab
 # + Prism export (wide, 1 row per elapsed): elapsed in rows; columns = receptor/treatment/passages
 #   organized first by receptor then by treatment, replicates stacked by Passage.
 # + Plot defaults: facet by Passage; color by receptor.
-# + Tabs: Plot, Join checks, File preview, Normalized, Prism preview
+# + Tabs: Plot, Join checks, File preview, Factor editor, Normalized, Prism preview
 # + Normalization methods: None, Ratio, Log2 ratio, OLS-adjusted (control-adjusted signal)
 
 library(shiny)
@@ -189,7 +190,6 @@ preview_file_lines <- function(path, n = 10) {
 # computed within Passage + Condition across timepoints:
 #   fit: signal = a + b*control
 #   adjusted: signal_adj = signal - b*(control - mean(control))
-# (keeps signal scale; corrects for control fluctuations)
 # ---------------------------
 ols_control_adjust <- function(df, sig_col, ctl_col) {
   x <- df[[ctl_col]]
@@ -232,6 +232,7 @@ ui <- fluidPage(
       actionButton("run", "Import + Process", class = "btn-primary"),
       hr(),
       h4("Downloads"),
+      downloadButton("download_factor_map", "Factor assignments (csv)"),
       downloadButton("download_norm", "Normalized by Passage (csv)"),
       downloadButton("download_prism", "Prism wide export (csv)")
     ),
@@ -240,6 +241,12 @@ ui <- fluidPage(
         tabPanel("Plot", plotOutput("plot", height = 460)),
         tabPanel("Join checks", verbatimTextOutput("join_checks")),
         tabPanel("File preview", tableOutput("preview_files")),
+        tabPanel(
+          "Factor editor",
+          br(),
+          tags$p("Edit the auto-assigned receptor and treatment values for each condition header."),
+          uiOutput("factor_editor_ui")
+        ),
         tabPanel("Normalized", tableOutput("preview_norm")),
         tabPanel("Prism preview", tableOutput("preview_prism"))
       )
@@ -285,7 +292,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # Safe getter for dynamic inputs
   channel_map <- reactive({
     req(input$files)
     fns <- input$files$name
@@ -310,7 +316,7 @@ server <- function(input, output, session) {
     )
   })
   
-  # File preview tab: first 10 lines of each raw file (stacked)
+  # File preview tab
   output$preview_files <- renderTable({
     req(input$files)
     tibble(file = input$files$name, path = input$files$datapath) %>%
@@ -354,8 +360,8 @@ server <- function(input, output, session) {
     )
   })
   
-  # Import + add receptor/treatment
-  raw_long <- eventReactive(input$run, {
+  # Base imported data with auto-guessed factors
+  raw_long_auto <- eventReactive(input$run, {
     cm <- channel_map()
     
     dat <- purrr::pmap_dfr(cm, function(file, path, channel) {
@@ -384,11 +390,102 @@ server <- function(input, output, session) {
     dat %>%
       left_join(annot, by = c("condition" = "condition_raw")) %>%
       mutate(
-        receptor = fct_explicit_na(receptor, na_level = "none"),
-        treatment = fct_explicit_na(treatment, na_level = "VEH")
+        receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
+        treatment = forcats::fct_explicit_na(treatment, na_level = "VEH")
       ) %>%
       relocate(receptor, treatment, .after = condition)
   }, ignoreInit = TRUE)
+  
+  # Editable factor map
+  factor_map_default <- reactive({
+    req(raw_long_auto())
+    raw_long_auto() %>%
+      distinct(condition, receptor, treatment) %>%
+      mutate(
+        receptor = as.character(receptor),
+        treatment = as.character(treatment)
+      ) %>%
+      arrange(condition)
+  })
+  
+  output$factor_editor_ui <- renderUI({
+    req(factor_map_default())
+    fm <- factor_map_default()
+    
+    receptor_choices <- c("none", "era", "erb", "pgr", "pra", "prb", "gr",
+                          "era + pra", "era + prb", "erb + pra", "erb + prb",
+                          "era + pgr", "erb + pgr", "era + gr", "erb + gr",
+                          "pra + gr", "prb + gr", "pgr + gr")
+    treatment_choices <- unique(c(
+      "VEH",
+      sort(unique(as.character(fm$treatment)))
+    ))
+    
+    tagList(
+      fluidRow(
+        column(6, tags$b("Condition header")),
+        column(3, tags$b("Receptor")),
+        column(3, tags$b("Treatment"))
+      ),
+      lapply(seq_len(nrow(fm)), function(i) {
+        fluidRow(
+          column(6, tags$small(fm$condition[i])),
+          column(
+            3,
+            selectInput(
+              inputId = paste0("receptor_edit_", i),
+              label = NULL,
+              choices = receptor_choices,
+              selected = fm$receptor[i]
+            )
+          ),
+          column(
+            3,
+            textInput(
+              inputId = paste0("treatment_edit_", i),
+              label = NULL,
+              value = fm$treatment[i]
+            )
+          )
+        )
+      })
+    )
+  })
+  
+  edited_factor_map <- reactive({
+    req(factor_map_default())
+    fm <- factor_map_default()
+    
+    tibble(
+      condition = fm$condition,
+      receptor = purrr::map_chr(seq_len(nrow(fm)), function(i) {
+        val <- input[[paste0("receptor_edit_", i)]]
+        if (is.null(val) || identical(val, "")) fm$receptor[i] else val
+      }),
+      treatment = purrr::map_chr(seq_len(nrow(fm)), function(i) {
+        val <- input[[paste0("treatment_edit_", i)]]
+        if (is.null(val) || identical(trimws(val), "")) "VEH" else trimws(val)
+      })
+    ) %>%
+      mutate(
+        receptor = factor(receptor),
+        treatment = factor(treatment)
+      )
+  })
+  
+  # Final raw data with edited factor assignments applied
+  raw_long <- reactive({
+    req(raw_long_auto(), edited_factor_map())
+    
+    raw_long_auto() %>%
+      select(-receptor, -treatment) %>%
+      left_join(edited_factor_map(), by = "condition") %>%
+      mutate(
+        receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
+        treatment = forcats::fct_explicit_na(treatment, na_level = "VEH")
+      ) %>%
+      relocate(receptor, treatment, .after = condition)
+  })
   
   output$join_checks <- renderPrint({
     req(raw_long())
@@ -409,10 +506,11 @@ server <- function(input, output, session) {
       )
     
     parse_cov <- rl %>%
+      distinct(condition, receptor, treatment) %>%
       summarize(
-        n_conditions = n_distinct(condition),
-        receptor_levels = paste(levels(receptor), collapse = ", "),
-        treatment_levels = paste(levels(treatment), collapse = ", "),
+        n_conditions = n(),
+        receptor_levels = paste(sort(unique(as.character(receptor))), collapse = ", "),
+        treatment_levels = paste(sort(unique(as.character(treatment))), collapse = ", "),
         receptor_none_frac = mean(as.character(receptor) == "none", na.rm = TRUE),
         treatment_veh_frac = mean(as.character(treatment) == "VEH", na.rm = TRUE)
       )
@@ -420,12 +518,12 @@ server <- function(input, output, session) {
     list(
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
-      parsing_coverage = parse_cov,
-      note = "Defaults: receptor='none' if no receptor token found; treatment='VEH' if no treatment token found."
+      factor_assignment_summary = parse_cov,
+      note = "Factor editor overrides the auto-assigned receptor and treatment values."
     )
   })
   
-  # Wide join WITHIN Passage (stats-friendly backbone)
+  # Wide join WITHIN Passage
   wide_joined_passage <- reactive({
     req(raw_long())
     raw_long() %>%
@@ -453,7 +551,7 @@ server <- function(input, output, session) {
     if (method %in% c("none", "ratio", "log2ratio")) {
       out <- out %>%
         mutate(
-          value_norm = case_when(
+          value_norm = dplyr::case_when(
             method == "none" ~ .data[[sig]],
             method == "ratio" ~ .data[[sig]] / .data[[ctl]],
             method == "log2ratio" ~ log2(.data[[sig]] / .data[[ctl]]),
@@ -461,7 +559,6 @@ server <- function(input, output, session) {
           )
         )
     } else if (method == "ols_adj") {
-      # control-adjust within Passage + Condition across timepoints
       out <- out %>%
         group_by(passage, condition) %>%
         group_modify(~ ols_control_adjust(.x, sig_col = sig, ctl_col = ctl)) %>%
@@ -489,20 +586,19 @@ server <- function(input, output, session) {
     head(normalized_passage(), 20)
   }, striped = TRUE)
   
-  # Stats-like long table for plotting/export
+  # Stats-like long table
   stats_long <- reactive({
     req(normalized_passage())
     normalized_passage() %>%
       mutate(
-        receptor = fct_explicit_na(receptor, na_level = "none"),
-        treatment = fct_explicit_na(treatment, na_level = "VEH")
+        receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
+        treatment = forcats::fct_explicit_na(treatment, na_level = "VEH")
       ) %>%
       select(passage, elapsed, condition, receptor, treatment, value_norm) %>%
       arrange(receptor, treatment, passage, condition, elapsed)
   })
   
-  # Prism export: ONE ROW PER ELAPSED
-  # Collapse across condition within each receptor+treatment+passage at each time (mean).
+  # Prism export
   prism_wide <- reactive({
     req(stats_long())
     df <- stats_long() %>%
@@ -526,7 +622,7 @@ server <- function(input, output, session) {
     head(prism_wide(), 20)
   }, striped = TRUE)
   
-  # Plot defaults: facet by Passage; color by receptor
+  # Plot
   output$plot <- renderPlot({
     req(stats_long())
     df <- stats_long()
@@ -548,14 +644,20 @@ server <- function(input, output, session) {
       theme_minimal()
   })
   
-  # ---------------------------
   # Downloads
-  # ---------------------------
+  output$download_factor_map <- downloadHandler(
+    filename = function() paste0("incucyte_factor_assignments_", Sys.Date(), ".csv"),
+    content = function(file) {
+      req(edited_factor_map())
+      readr::write_csv(edited_factor_map(), file)
+    }
+  )
+  
   output$download_norm <- downloadHandler(
     filename = function() paste0("incucyte_normalized_by_passage_", Sys.Date(), ".csv"),
     content = function(file) {
       req(normalized_passage())
-      write_csv(normalized_passage(), file)
+      readr::write_csv(normalized_passage(), file)
     }
   )
   
@@ -563,7 +665,7 @@ server <- function(input, output, session) {
     filename = function() paste0("incucyte_prism_wide_1row_per_time_", Sys.Date(), ".csv"),
     content = function(file) {
       req(prism_wide())
-      write_csv(prism_wide(), file)
+      readr::write_csv(prism_wide(), file)
     }
   )
 }
