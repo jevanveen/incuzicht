@@ -1,20 +1,19 @@
 # app.R
-# Incucyte Multi-File Import + Channel Normalization (Passage as surrogate BioRep)
-# + Condition header parser -> receptor + treatment factors (defaults: receptor="none", treatment="VEH")
-# + Editable factor assignments tab
-# + Prism export (wide, 1 row per elapsed): elapsed in rows; columns = receptor/treatment/passages
-#   organized first by receptor then by treatment, replicates stacked by Passage.
-# + Plot defaults: facet by Passage; color by receptor.
-# + Tabs: Plot, Join checks, File preview, Factor editor, Normalized, Prism preview
-# + Normalization methods: None, Ratio, Log2 ratio, OLS-adjusted (control-adjusted signal)
+# Incucyte Multi-File Import + Channel Normalization
+# - Passage parsed from header as surrogate biological replicate
+# - Auto-parse receptor + treatment from condition headers
+# - Draggable factor editor (receptor + treatment) using sortable
+# - Prism export with one row per elapsed time
+# - Plot defaults: facet by Passage; color by receptor
 
 library(shiny)
 library(tidyverse)
 library(readr)
 library(stringr)
+library(sortable)
 
 # ---------------------------
-# Helpers: parse Incucyte header metadata
+# Helpers
 # ---------------------------
 find_data_header_row <- function(lines) {
   idx <- which(str_detect(lines, "^Date Time\\tElapsed\\b"))
@@ -45,9 +44,6 @@ read_incucyte_header_meta <- function(path) {
   )
 }
 
-# ---------------------------
-# Reader: Incucyte wide-by-condition export -> tidy long
-# ---------------------------
 read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
   lines <- readLines(path, warn = FALSE)
   header_i <- find_data_header_row(lines)
@@ -70,7 +66,7 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
   dat %>%
     mutate(
       datetime = as.character(datetime),
-      elapsed  = suppressWarnings(as.numeric(elapsed))
+      elapsed = suppressWarnings(as.numeric(elapsed))
     ) %>%
     pivot_longer(
       cols = -c(datetime, elapsed),
@@ -79,16 +75,10 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
     ) %>%
     mutate(
       condition = as.character(condition),
-      value     = suppressWarnings(as.numeric(value))
+      value = suppressWarnings(as.numeric(value))
     )
 }
 
-# ---------------------------
-# Condition header parsing: receptor + treatment factors
-# Defaults:
-# - receptor: "none"
-# - treatment: "VEH"
-# ---------------------------
 canonicalize_receptor_token <- function(x) {
   z <- x %>%
     str_to_lower() %>%
@@ -129,7 +119,7 @@ parse_treatment_token <- function(x) {
 }
 
 canonicalize_receptor_combo <- function(receptors) {
-  order <- c("era", "erb", "pgr", "pra", "prb", "gr")
+  order <- c("none", "era", "erb", "pgr", "pra", "prb", "gr")
   recs <- unique(na.omit(receptors))
   if (length(recs) == 0) return("none")
   recs <- recs[order(match(recs, order, nomatch = 999))]
@@ -177,20 +167,11 @@ guess_receptor_treatment <- function(condition_vec) {
     select(condition_raw, receptor, treatment)
 }
 
-# ---------------------------
-# File preview helper: first N lines
-# ---------------------------
 preview_file_lines <- function(path, n = 10) {
   lines <- readLines(path, warn = FALSE, n = n)
   tibble(line_no = seq_along(lines), line = lines)
 }
 
-# ---------------------------
-# OLS normalization helper: control-adjusted signal
-# computed within Passage + Condition across timepoints:
-#   fit: signal = a + b*control
-#   adjusted: signal_adj = signal - b*(control - mean(control))
-# ---------------------------
 ols_control_adjust <- function(df, sig_col, ctl_col) {
   x <- df[[ctl_col]]
   y <- df[[sig_col]]
@@ -212,11 +193,18 @@ ols_control_adjust <- function(df, sig_col, ctl_col) {
   df
 }
 
+safe_id <- function(x) {
+  x %>%
+    stringr::str_replace_all("[^A-Za-z0-9]+", "_") %>%
+    stringr::str_replace_all("^_+|_+$", "") %>%
+    tolower()
+}
+
 # ---------------------------
 # UI
 # ---------------------------
 ui <- fluidPage(
-  titlePanel("Incucyte Multi-File Import + Channel Normalization (Passage + receptor/treatment + Prism export)"),
+  titlePanel("Incucyte Multi-File Import + Channel Normalization"),
   sidebarLayout(
     sidebarPanel(
       fileInput(
@@ -239,14 +227,25 @@ ui <- fluidPage(
     mainPanel(
       tabsetPanel(
         tabPanel("Plot", plotOutput("plot", height = 460)),
-        tabPanel("Join checks", verbatimTextOutput("join_checks")),
-        tabPanel("File preview", tableOutput("preview_files")),
         tabPanel(
           "Factor editor",
           br(),
-          tags$p("Edit the auto-assigned receptor and treatment values for each condition header."),
+          tags$p("Drag condition headers between buckets to correct receptor and treatment assignments."),
+          fluidRow(
+            column(
+              8,
+              textInput("new_treatment_bucket", "Add new treatment bucket", value = "")
+            ),
+            column(
+              4,
+              br(),
+              actionButton("add_treatment_bucket", "Add treatment bucket")
+            )
+          ),
           uiOutput("factor_editor_ui")
         ),
+        tabPanel("Join checks", verbatimTextOutput("join_checks")),
+        tabPanel("File preview", tableOutput("preview_files")),
         tabPanel("Normalized", tableOutput("preview_norm")),
         tabPanel("Prism preview", tableOutput("preview_prism"))
       )
@@ -259,7 +258,6 @@ ui <- fluidPage(
 # ---------------------------
 server <- function(input, output, session) {
   
-  # Dynamic UI: per-file channel assignment
   output$channel_map_ui <- renderUI({
     req(input$files)
     fns <- input$files$name
@@ -316,7 +314,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # File preview tab
   output$preview_files <- renderTable({
     req(input$files)
     tibble(file = input$files$name, path = input$files$datapath) %>%
@@ -326,7 +323,6 @@ server <- function(input, output, session) {
       select(file, line_no, line)
   }, striped = TRUE)
   
-  # Normalization UI
   output$norm_ui <- renderUI({
     req(channel_map())
     chans <- sort(unique(channel_map()$channel))
@@ -360,7 +356,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # Base imported data with auto-guessed factors
   raw_long_auto <- eventReactive(input$run, {
     cm <- channel_map()
     
@@ -396,7 +391,6 @@ server <- function(input, output, session) {
       relocate(receptor, treatment, .after = condition)
   }, ignoreInit = TRUE)
   
-  # Editable factor map
   factor_map_default <- reactive({
     req(raw_long_auto())
     raw_long_auto() %>%
@@ -408,72 +402,123 @@ server <- function(input, output, session) {
       arrange(condition)
   })
   
+  receptor_levels <- reactive({
+    req(factor_map_default())
+    defaults <- c("none", "era", "erb", "pgr", "pra", "prb", "gr")
+    extra <- factor_map_default() %>%
+      pull(receptor) %>%
+      unique()
+    unique(c(defaults, extra))
+  })
+  
+  treatment_levels_rv <- reactiveVal(NULL)
+  
+  observeEvent(factor_map_default(), {
+    base_levels <- factor_map_default() %>%
+      pull(treatment) %>%
+      unique() %>%
+      as.character()
+    treatment_levels_rv(unique(c("VEH", sort(base_levels))))
+  }, ignoreInit = FALSE)
+  
+  observeEvent(input$add_treatment_bucket, {
+    current <- treatment_levels_rv()
+    new_val <- trimws(input$new_treatment_bucket %||% "")
+    if (nzchar(new_val)) {
+      treatment_levels_rv(unique(c(current, new_val)))
+      updateTextInput(session, "new_treatment_bucket", value = "")
+    }
+  })
+  
   output$factor_editor_ui <- renderUI({
     req(factor_map_default())
     fm <- factor_map_default()
     
-    receptor_choices <- c("none", "era", "erb", "pgr", "pra", "prb", "gr",
-                          "era + pra", "era + prb", "erb + pra", "erb + prb",
-                          "era + pgr", "erb + pgr", "era + gr", "erb + gr",
-                          "pra + gr", "prb + gr", "pgr + gr")
-    treatment_choices <- unique(c(
-      "VEH",
-      sort(unique(as.character(fm$treatment)))
-    ))
+    receptor_buckets <- setNames(vector("list", length(receptor_levels())), receptor_levels())
+    for (lvl in names(receptor_buckets)) {
+      receptor_buckets[[lvl]] <- fm %>%
+        filter(receptor == lvl) %>%
+        pull(condition)
+    }
+    
+    treatment_levels <- treatment_levels_rv()
+    req(treatment_levels)
+    treatment_buckets <- setNames(vector("list", length(treatment_levels)), treatment_levels)
+    for (lvl in names(treatment_buckets)) {
+      treatment_buckets[[lvl]] <- fm %>%
+        filter(treatment == lvl) %>%
+        pull(condition)
+    }
     
     tagList(
-      fluidRow(
-        column(6, tags$b("Condition header")),
-        column(3, tags$b("Receptor")),
-        column(3, tags$b("Treatment"))
-      ),
-      lapply(seq_len(nrow(fm)), function(i) {
-        fluidRow(
-          column(6, tags$small(fm$condition[i])),
-          column(
-            3,
-            selectInput(
-              inputId = paste0("receptor_edit_", i),
-              label = NULL,
-              choices = receptor_choices,
-              selected = fm$receptor[i]
-            )
-          ),
-          column(
-            3,
-            textInput(
-              inputId = paste0("treatment_edit_", i),
-              label = NULL,
-              value = fm$treatment[i]
-            )
+      h4("Receptor"),
+      bucket_list(
+        header = NULL,
+        group_name = "receptor_bucket_group",
+        orientation = "horizontal",
+        lapply(names(receptor_buckets), function(lvl) {
+          rank_list(
+            text = receptor_buckets[[lvl]],
+            labels = lvl,
+            input_id = paste0("receptor_bucket_", safe_id(lvl))
           )
-        )
-      })
+        })
+      ),
+      br(),
+      h4("Treatment"),
+      bucket_list(
+        header = NULL,
+        group_name = "treatment_bucket_group",
+        orientation = "horizontal",
+        lapply(names(treatment_buckets), function(lvl) {
+          rank_list(
+            text = treatment_buckets[[lvl]],
+            labels = lvl,
+            input_id = paste0("treatment_bucket_", safe_id(lvl))
+          )
+        })
+      )
     )
   })
   
   edited_factor_map <- reactive({
     req(factor_map_default())
+    
     fm <- factor_map_default()
     
-    tibble(
-      condition = fm$condition,
-      receptor = purrr::map_chr(seq_len(nrow(fm)), function(i) {
-        val <- input[[paste0("receptor_edit_", i)]]
-        if (is.null(val) || identical(val, "")) fm$receptor[i] else val
-      }),
-      treatment = purrr::map_chr(seq_len(nrow(fm)), function(i) {
-        val <- input[[paste0("treatment_edit_", i)]]
-        if (is.null(val) || identical(trimws(val), "")) "VEH" else trimws(val)
-      })
-    ) %>%
+    receptor_map <- purrr::map_dfr(receptor_levels(), function(lvl) {
+      id <- paste0("receptor_bucket_", safe_id(lvl))
+      vals <- input[[id]]
+      if (is.null(vals)) {
+        vals <- fm %>% filter(receptor == lvl) %>% pull(condition)
+      }
+      tibble(condition = vals, receptor = lvl)
+    })
+    
+    treatment_levels <- treatment_levels_rv()
+    req(treatment_levels)
+    
+    treatment_map <- purrr::map_dfr(treatment_levels, function(lvl) {
+      id <- paste0("treatment_bucket_", safe_id(lvl))
+      vals <- input[[id]]
+      if (is.null(vals)) {
+        vals <- fm %>% filter(treatment == lvl) %>% pull(condition)
+      }
+      tibble(condition = vals, treatment = lvl)
+    })
+    
+    fm %>%
+      select(condition) %>%
+      left_join(receptor_map, by = "condition") %>%
+      left_join(treatment_map, by = "condition") %>%
       mutate(
+        receptor = replace_na(receptor, "none"),
+        treatment = replace_na(treatment, "VEH"),
         receptor = factor(receptor),
         treatment = factor(treatment)
       )
   })
   
-  # Final raw data with edited factor assignments applied
   raw_long <- reactive({
     req(raw_long_auto(), edited_factor_map())
     
@@ -505,25 +550,22 @@ server <- function(input, output, session) {
         .groups = "drop"
       )
     
-    parse_cov <- rl %>%
+    factor_summary <- rl %>%
       distinct(condition, receptor, treatment) %>%
       summarize(
         n_conditions = n(),
         receptor_levels = paste(sort(unique(as.character(receptor))), collapse = ", "),
-        treatment_levels = paste(sort(unique(as.character(treatment))), collapse = ", "),
-        receptor_none_frac = mean(as.character(receptor) == "none", na.rm = TRUE),
-        treatment_veh_frac = mean(as.character(treatment) == "VEH", na.rm = TRUE)
+        treatment_levels = paste(sort(unique(as.character(treatment))), collapse = ", ")
       )
     
     list(
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
-      factor_assignment_summary = parse_cov,
-      note = "Factor editor overrides the auto-assigned receptor and treatment values."
+      factor_assignment_summary = factor_summary,
+      note = "Factor editor uses draggable buckets. Moving a condition between buckets overrides the auto-assigned value."
     )
   })
   
-  # Wide join WITHIN Passage
   wide_joined_passage <- reactive({
     req(raw_long())
     raw_long() %>%
@@ -533,7 +575,6 @@ server <- function(input, output, session) {
       pivot_wider(names_from = channel, values_from = value)
   })
   
-  # Normalized within Passage + Condition
   normalized_passage <- reactive({
     req(wide_joined_passage())
     w <- wide_joined_passage()
@@ -586,7 +627,6 @@ server <- function(input, output, session) {
     head(normalized_passage(), 20)
   }, striped = TRUE)
   
-  # Stats-like long table
   stats_long <- reactive({
     req(normalized_passage())
     normalized_passage() %>%
@@ -598,7 +638,6 @@ server <- function(input, output, session) {
       arrange(receptor, treatment, passage, condition, elapsed)
   })
   
-  # Prism export
   prism_wide <- reactive({
     req(stats_long())
     df <- stats_long() %>%
@@ -622,7 +661,6 @@ server <- function(input, output, session) {
     head(prism_wide(), 20)
   }, striped = TRUE)
   
-  # Plot
   output$plot <- renderPlot({
     req(stats_long())
     df <- stats_long()
@@ -644,7 +682,6 @@ server <- function(input, output, session) {
       theme_minimal()
   })
   
-  # Downloads
   output$download_factor_map <- downloadHandler(
     filename = function() paste0("incucyte_factor_assignments_", Sys.Date(), ".csv"),
     content = function(file) {
