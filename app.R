@@ -195,8 +195,8 @@ ols_control_adjust <- function(df, sig_col, ctl_col) {
 
 safe_id <- function(x) {
   x %>%
-    stringr::str_replace_all("[^A-Za-z0-9]+", "_") %>%
-    stringr::str_replace_all("^_+|_+$", "") %>%
+    str_replace_all("[^A-Za-z0-9]+", "_") %>%
+    str_replace_all("^_+|_+$", "") %>%
     tolower()
 }
 
@@ -208,10 +208,14 @@ make_bucket_ui <- function(bucket_values, prefix, group_name) {
       orientation = "horizontal"
     ),
     lapply(names(bucket_values), function(lvl) {
-      sortable::add_rank_list(
-        text = unname(bucket_values[[lvl]]),
-        labels = lvl,
-        input_id = paste0(prefix, safe_id(lvl))
+      div(
+        style = "min-width: 260px; max-width: 320px; margin-right: 14px; vertical-align: top;",
+        tags$strong(lvl),
+        sortable::rank_list(
+          text = unname(bucket_values[[lvl]]),
+          labels = FALSE,
+          input_id = paste0(prefix, safe_id(lvl))
+        )
       )
     })
   )
@@ -520,8 +524,8 @@ server <- function(input, output, session) {
       left_join(receptor_map, by = "condition") %>%
       left_join(treatment_map, by = "condition") %>%
       mutate(
-        receptor = replace_na(receptor, "none"),
-        treatment = replace_na(treatment, "VEH"),
+        receptor = tidyr::replace_na(receptor, "none"),
+        treatment = tidyr::replace_na(treatment, "VEH"),
         receptor = factor(receptor),
         treatment = factor(treatment)
       )
@@ -694,7 +698,7 @@ server <- function(input, output, session) {
     filename = function() paste0("incucyte_factor_assignments_", Sys.Date(), ".csv"),
     content = function(file) {
       req(edited_factor_map())
-      readr::write_csv(edited_factor_map(), file)
+      write_csv(edited_factor_map(), file)
     }
   )
   
@@ -702,7 +706,7 @@ server <- function(input, output, session) {
     filename = function() paste0("incucyte_normalized_by_passage_", Sys.Date(), ".csv"),
     content = function(file) {
       req(normalized_passage())
-      readr::write_csv(normalized_passage(), file)
+      write_csv(normalized_passage(), file)
     }
   )
   
@@ -710,7 +714,7 @@ server <- function(input, output, session) {
     filename = function() paste0("incucyte_prism_wide_1row_per_time_", Sys.Date(), ".csv"),
     content = function(file) {
       req(prism_wide())
-      readr::write_csv(prism_wide(), file)
+      write_csv(prism_wide(), file)
     }
   )
 }
