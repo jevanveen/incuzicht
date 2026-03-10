@@ -200,6 +200,25 @@ safe_id <- function(x) {
     tolower()
 }
 
+make_bucket_ui <- function(bucket_values, prefix, group_name) {
+  bucket_args <- c(
+    list(
+      header = NULL,
+      group_name = group_name,
+      orientation = "horizontal"
+    ),
+    lapply(names(bucket_values), function(lvl) {
+      sortable::add_rank_list(
+        text = unname(bucket_values[[lvl]]),
+        labels = lvl,
+        input_id = paste0(prefix, safe_id(lvl))
+      )
+    })
+  )
+  
+  do.call(sortable::bucket_list, bucket_args)
+}
+
 # ---------------------------
 # UI
 # ---------------------------
@@ -438,45 +457,34 @@ server <- function(input, output, session) {
     for (lvl in names(receptor_buckets)) {
       receptor_buckets[[lvl]] <- fm %>%
         filter(receptor == lvl) %>%
-        pull(condition)
+        pull(condition) %>%
+        as.character()
     }
     
     treatment_levels <- treatment_levels_rv()
     req(treatment_levels)
+    
     treatment_buckets <- setNames(vector("list", length(treatment_levels)), treatment_levels)
     for (lvl in names(treatment_buckets)) {
       treatment_buckets[[lvl]] <- fm %>%
         filter(treatment == lvl) %>%
-        pull(condition)
+        pull(condition) %>%
+        as.character()
     }
     
     tagList(
       h4("Receptor"),
-      bucket_list(
-        header = NULL,
-        group_name = "receptor_bucket_group",
-        orientation = "horizontal",
-        lapply(names(receptor_buckets), function(lvl) {
-          rank_list(
-            text = receptor_buckets[[lvl]],
-            labels = lvl,
-            input_id = paste0("receptor_bucket_", safe_id(lvl))
-          )
-        })
+      make_bucket_ui(
+        bucket_values = receptor_buckets,
+        prefix = "receptor_bucket_",
+        group_name = "receptor_bucket_group"
       ),
       br(),
       h4("Treatment"),
-      bucket_list(
-        header = NULL,
-        group_name = "treatment_bucket_group",
-        orientation = "horizontal",
-        lapply(names(treatment_buckets), function(lvl) {
-          rank_list(
-            text = treatment_buckets[[lvl]],
-            labels = lvl,
-            input_id = paste0("treatment_bucket_", safe_id(lvl))
-          )
-        })
+      make_bucket_ui(
+        bucket_values = treatment_buckets,
+        prefix = "treatment_bucket_",
+        group_name = "treatment_bucket_group"
       )
     )
   })
@@ -492,7 +500,7 @@ server <- function(input, output, session) {
       if (is.null(vals)) {
         vals <- fm %>% filter(receptor == lvl) %>% pull(condition)
       }
-      tibble(condition = vals, receptor = lvl)
+      tibble(condition = as.character(vals), receptor = lvl)
     })
     
     treatment_levels <- treatment_levels_rv()
@@ -504,7 +512,7 @@ server <- function(input, output, session) {
       if (is.null(vals)) {
         vals <- fm %>% filter(treatment == lvl) %>% pull(condition)
       }
-      tibble(condition = vals, treatment = lvl)
+      tibble(condition = as.character(vals), treatment = lvl)
     })
     
     fm %>%
@@ -672,7 +680,7 @@ server <- function(input, output, session) {
     }
     
     ggplot(df, aes(x = elapsed, y = value_norm, group = condition, color = receptor)) +
-      geom_line(alpha = 0.6) +
+      geom_line(alpha = 0.6, na.rm = TRUE) +
       facet_wrap(~ passage) +
       labs(
         x = "Elapsed time",
