@@ -2,7 +2,7 @@
 # Incucyte Multi-File Import + Channel Normalization
 # - Passage parsed from header as surrogate biological replicate
 # - Auto-parse receptor + treatment from condition headers
-# - Draggable factor editor (receptor + treatment) using sortable
+# - Plain editable factor editor (no sortable)
 # - Prism export with one row per elapsed time
 # - Plot defaults: facet by Passage; color by receptor
 
@@ -10,7 +10,6 @@ library(shiny)
 library(tidyverse)
 library(readr)
 library(stringr)
-library(sortable)
 
 # ---------------------------
 # Helpers
@@ -193,36 +192,6 @@ ols_control_adjust <- function(df, sig_col, ctl_col) {
   df
 }
 
-safe_id <- function(x) {
-  x %>%
-    str_replace_all("[^A-Za-z0-9]+", "_") %>%
-    str_replace_all("^_+|_+$", "") %>%
-    tolower()
-}
-
-make_bucket_ui <- function(bucket_values, prefix, group_name) {
-  bucket_args <- c(
-    list(
-      header = NULL,
-      group_name = group_name,
-      orientation = "horizontal"
-    ),
-    lapply(names(bucket_values), function(lvl) {
-      div(
-        style = "min-width: 260px; max-width: 320px; margin-right: 14px; vertical-align: top;",
-        tags$strong(lvl),
-        sortable::rank_list(
-          text = unname(bucket_values[[lvl]]),
-          labels = FALSE,
-          input_id = paste0(prefix, safe_id(lvl))
-        )
-      )
-    })
-  )
-  
-  do.call(sortable::bucket_list, bucket_args)
-}
-
 # ---------------------------
 # UI
 # ---------------------------
@@ -253,18 +222,7 @@ ui <- fluidPage(
         tabPanel(
           "Factor editor",
           br(),
-          tags$p("Drag condition headers between buckets to correct receptor and treatment assignments."),
-          fluidRow(
-            column(
-              8,
-              textInput("new_treatment_bucket", "Add new treatment bucket", value = "")
-            ),
-            column(
-              4,
-              br(),
-              actionButton("add_treatment_bucket", "Add treatment bucket")
-            )
-          ),
+          tags$p("Edit the auto-assigned receptor and treatment values for each condition header."),
           uiOutput("factor_editor_ui")
         ),
         tabPanel("Join checks", verbatimTextOutput("join_checks")),
@@ -379,6 +337,9 @@ server <- function(input, output, session) {
     )
   })
   
+  # ---------------------------
+  # Imported data with auto-guessed factors
+  # ---------------------------
   raw_long_auto <- eventReactive(input$run, {
     cm <- channel_map()
     
@@ -425,107 +386,64 @@ server <- function(input, output, session) {
       arrange(condition)
   })
   
-  receptor_levels <- reactive({
-    req(factor_map_default())
-    defaults <- c("none", "era", "erb", "pgr", "pra", "prb", "gr")
-    extra <- factor_map_default() %>%
-      pull(receptor) %>%
-      unique()
-    unique(c(defaults, extra))
-  })
-  
-  treatment_levels_rv <- reactiveVal(NULL)
-  
-  observeEvent(factor_map_default(), {
-    base_levels <- factor_map_default() %>%
-      pull(treatment) %>%
-      unique() %>%
-      as.character()
-    treatment_levels_rv(unique(c("VEH", sort(base_levels))))
-  }, ignoreInit = FALSE)
-  
-  observeEvent(input$add_treatment_bucket, {
-    current <- treatment_levels_rv()
-    new_val <- trimws(input$new_treatment_bucket %||% "")
-    if (nzchar(new_val)) {
-      treatment_levels_rv(unique(c(current, new_val)))
-      updateTextInput(session, "new_treatment_bucket", value = "")
-    }
-  })
-  
   output$factor_editor_ui <- renderUI({
     req(factor_map_default())
     fm <- factor_map_default()
     
-    receptor_buckets <- setNames(vector("list", length(receptor_levels())), receptor_levels())
-    for (lvl in names(receptor_buckets)) {
-      receptor_buckets[[lvl]] <- fm %>%
-        filter(receptor == lvl) %>%
-        pull(condition) %>%
-        as.character()
-    }
-    
-    treatment_levels <- treatment_levels_rv()
-    req(treatment_levels)
-    
-    treatment_buckets <- setNames(vector("list", length(treatment_levels)), treatment_levels)
-    for (lvl in names(treatment_buckets)) {
-      treatment_buckets[[lvl]] <- fm %>%
-        filter(treatment == lvl) %>%
-        pull(condition) %>%
-        as.character()
-    }
+    receptor_choices <- c(
+      "none", "era", "erb", "pgr", "pra", "prb", "gr",
+      "era + pra", "era + prb", "erb + pra", "erb + prb",
+      "era + pgr", "erb + pgr", "era + gr", "erb + gr",
+      "pra + gr", "prb + gr", "pgr + gr"
+    )
     
     tagList(
-      h4("Receptor"),
-      make_bucket_ui(
-        bucket_values = receptor_buckets,
-        prefix = "receptor_bucket_",
-        group_name = "receptor_bucket_group"
+      fluidRow(
+        column(6, tags$b("Condition header")),
+        column(3, tags$b("Receptor")),
+        column(3, tags$b("Treatment"))
       ),
-      br(),
-      h4("Treatment"),
-      make_bucket_ui(
-        bucket_values = treatment_buckets,
-        prefix = "treatment_bucket_",
-        group_name = "treatment_bucket_group"
-      )
+      lapply(seq_len(nrow(fm)), function(i) {
+        fluidRow(
+          column(6, tags$small(fm$condition[i])),
+          column(
+            3,
+            selectInput(
+              inputId = paste0("receptor_edit_", i),
+              label = NULL,
+              choices = unique(c(fm$receptor[i], receptor_choices)),
+              selected = fm$receptor[i]
+            )
+          ),
+          column(
+            3,
+            textInput(
+              inputId = paste0("treatment_edit_", i),
+              label = NULL,
+              value = fm$treatment[i]
+            )
+          )
+        )
+      })
     )
   })
   
   edited_factor_map <- reactive({
     req(factor_map_default())
-    
     fm <- factor_map_default()
     
-    receptor_map <- purrr::map_dfr(receptor_levels(), function(lvl) {
-      id <- paste0("receptor_bucket_", safe_id(lvl))
-      vals <- input[[id]]
-      if (is.null(vals)) {
-        vals <- fm %>% filter(receptor == lvl) %>% pull(condition)
-      }
-      tibble(condition = as.character(vals), receptor = lvl)
-    })
-    
-    treatment_levels <- treatment_levels_rv()
-    req(treatment_levels)
-    
-    treatment_map <- purrr::map_dfr(treatment_levels, function(lvl) {
-      id <- paste0("treatment_bucket_", safe_id(lvl))
-      vals <- input[[id]]
-      if (is.null(vals)) {
-        vals <- fm %>% filter(treatment == lvl) %>% pull(condition)
-      }
-      tibble(condition = as.character(vals), treatment = lvl)
-    })
-    
-    fm %>%
-      select(condition) %>%
-      left_join(receptor_map, by = "condition") %>%
-      left_join(treatment_map, by = "condition") %>%
+    tibble(
+      condition = fm$condition,
+      receptor = purrr::map_chr(seq_len(nrow(fm)), function(i) {
+        val <- input[[paste0("receptor_edit_", i)]]
+        if (is.null(val) || identical(val, "")) fm$receptor[i] else val
+      }),
+      treatment = purrr::map_chr(seq_len(nrow(fm)), function(i) {
+        val <- input[[paste0("treatment_edit_", i)]]
+        if (is.null(val) || identical(trimws(val), "")) "VEH" else trimws(val)
+      })
+    ) %>%
       mutate(
-        receptor = tidyr::replace_na(receptor, "none"),
-        treatment = tidyr::replace_na(treatment, "VEH"),
         receptor = factor(receptor),
         treatment = factor(treatment)
       )
@@ -574,7 +492,7 @@ server <- function(input, output, session) {
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
       factor_assignment_summary = factor_summary,
-      note = "Factor editor uses draggable buckets. Moving a condition between buckets overrides the auto-assigned value."
+      note = "Factor editor overrides the auto-assigned receptor and treatment values."
     )
   })
   
