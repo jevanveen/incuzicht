@@ -2,7 +2,7 @@
 # Incucyte Multi-File Import + Channel Normalization
 # - Passage parsed from header as surrogate biological replicate
 # - Auto-parse receptor + treatment from condition headers
-# - Plain editable factor editor (no sortable)
+# - Editable factor editor using DT table
 # - Prism export with one row per elapsed time
 # - Plot defaults: facet by Passage; color by receptor
 
@@ -10,6 +10,7 @@ library(shiny)
 library(tidyverse)
 library(readr)
 library(stringr)
+library(DT)
 
 # ---------------------------
 # Helpers
@@ -211,6 +212,10 @@ ui <- fluidPage(
       uiOutput("norm_ui"),
       actionButton("run", "Import + Process", class = "btn-primary"),
       hr(),
+      h4("Factor editing"),
+      actionButton("reset_factor_map", "Reset factor assignments"),
+      actionButton("apply_factor_map", "Apply edited factor assignments", class = "btn-primary"),
+      hr(),
       h4("Downloads"),
       downloadButton("download_factor_map", "Factor assignments (csv)"),
       downloadButton("download_norm", "Normalized by Passage (csv)"),
@@ -222,8 +227,8 @@ ui <- fluidPage(
         tabPanel(
           "Factor editor",
           br(),
-          tags$p("Edit the auto-assigned receptor and treatment values for each condition header."),
-          uiOutput("factor_editor_ui")
+          tags$p("Edit receptor and treatment assignments directly in the table, then click 'Apply edited factor assignments'."),
+          DTOutput("factor_editor_table")
         ),
         tabPanel("Join checks", verbatimTextOutput("join_checks")),
         tabPanel("File preview", tableOutput("preview_files")),
@@ -386,75 +391,81 @@ server <- function(input, output, session) {
       arrange(condition)
   })
   
-  output$factor_editor_ui <- renderUI({
+  factor_map_rv <- reactiveVal(NULL)
+  
+  observeEvent(factor_map_default(), {
+    factor_map_rv(factor_map_default())
+  })
+  
+  observeEvent(input$reset_factor_map, {
     req(factor_map_default())
-    fm <- factor_map_default()
-    
-    receptor_choices <- c(
-      "none", "era", "erb", "pgr", "pra", "prb", "gr",
-      "era + pra", "era + prb", "erb + pra", "erb + prb",
-      "era + pgr", "erb + pgr", "era + gr", "erb + gr",
-      "pra + gr", "prb + gr", "pgr + gr"
-    )
-    
-    tagList(
-      fluidRow(
-        column(6, tags$b("Condition header")),
-        column(3, tags$b("Receptor")),
-        column(3, tags$b("Treatment"))
-      ),
-      lapply(seq_len(nrow(fm)), function(i) {
-        fluidRow(
-          column(6, tags$small(fm$condition[i])),
-          column(
-            3,
-            selectInput(
-              inputId = paste0("receptor_edit_", i),
-              label = NULL,
-              choices = unique(c(fm$receptor[i], receptor_choices)),
-              selected = fm$receptor[i]
-            )
-          ),
-          column(
-            3,
-            textInput(
-              inputId = paste0("treatment_edit_", i),
-              label = NULL,
-              value = fm$treatment[i]
-            )
-          )
-        )
-      })
+    factor_map_rv(factor_map_default())
+  })
+  
+  output$factor_editor_table <- renderDT({
+    req(factor_map_rv())
+    datatable(
+      factor_map_rv(),
+      rownames = FALSE,
+      editable = list(target = "cell", disable = list(columns = c(0))),
+      options = list(pageLength = 25, scrollX = TRUE)
     )
   })
   
-  edited_factor_map <- reactive({
-    req(factor_map_default())
-    fm <- factor_map_default()
+  observeEvent(input$factor_editor_table_cell_edit, {
+    req(factor_map_rv())
+    info <- input$factor_editor_table_cell_edit
+    df <- factor_map_rv()
     
-    tibble(
-      condition = fm$condition,
-      receptor = purrr::map_chr(seq_len(nrow(fm)), function(i) {
-        val <- input[[paste0("receptor_edit_", i)]]
-        if (is.null(val) || identical(val, "")) fm$receptor[i] else val
-      }),
-      treatment = purrr::map_chr(seq_len(nrow(fm)), function(i) {
-        val <- input[[paste0("treatment_edit_", i)]]
-        if (is.null(val) || identical(trimws(val), "")) "VEH" else trimws(val)
-      })
-    ) %>%
+    i <- info$row
+    j <- info$col
+    v <- info$value
+    
+    if (j == 1) {
+      df$receptor[i] <- trimws(v)
+      if (identical(df$receptor[i], "")) df$receptor[i] <- "none"
+    } else if (j == 2) {
+      df$treatment[i] <- trimws(v)
+      if (identical(df$treatment[i], "")) df$treatment[i] <- "VEH"
+    }
+    
+    factor_map_rv(df)
+  })
+  
+  edited_factor_map <- reactiveVal(NULL)
+  
+  observeEvent(input$apply_factor_map, {
+    req(factor_map_rv())
+    df <- factor_map_rv() %>%
       mutate(
+        receptor = if_else(trimws(receptor) == "", "none", trimws(receptor)),
+        treatment = if_else(trimws(treatment) == "", "VEH", trimws(treatment)),
         receptor = factor(receptor),
         treatment = factor(treatment)
       )
+    
+    edited_factor_map(df)
+  }, ignoreInit = TRUE)
+  
+  current_factor_map <- reactive({
+    if (!is.null(edited_factor_map())) {
+      edited_factor_map()
+    } else {
+      req(factor_map_rv())
+      factor_map_rv() %>%
+        mutate(
+          receptor = factor(if_else(trimws(receptor) == "", "none", trimws(receptor))),
+          treatment = factor(if_else(trimws(treatment) == "", "VEH", trimws(treatment)))
+        )
+    }
   })
   
   raw_long <- reactive({
-    req(raw_long_auto(), edited_factor_map())
+    req(raw_long_auto(), current_factor_map())
     
     raw_long_auto() %>%
       select(-receptor, -treatment) %>%
-      left_join(edited_factor_map(), by = "condition") %>%
+      left_join(current_factor_map(), by = "condition") %>%
       mutate(
         receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
         treatment = forcats::fct_explicit_na(treatment, na_level = "VEH")
@@ -492,7 +503,7 @@ server <- function(input, output, session) {
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
       factor_assignment_summary = factor_summary,
-      note = "Factor editor overrides the auto-assigned receptor and treatment values."
+      note = "Factor editor values come from the editable table. Click 'Apply edited factor assignments' after making changes."
     )
   })
   
@@ -615,8 +626,8 @@ server <- function(input, output, session) {
   output$download_factor_map <- downloadHandler(
     filename = function() paste0("incucyte_factor_assignments_", Sys.Date(), ".csv"),
     content = function(file) {
-      req(edited_factor_map())
-      write_csv(edited_factor_map(), file)
+      req(current_factor_map())
+      write_csv(current_factor_map(), file)
     }
   )
   
