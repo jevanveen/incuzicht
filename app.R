@@ -408,7 +408,10 @@ server <- function(input, output, session) {
       factor_map_rv(),
       rownames = FALSE,
       editable = list(target = "cell", disable = list(columns = c(0))),
-      options = list(pageLength = 25, scrollX = TRUE)
+      options = list(
+        pageLength = 25,
+        scrollX = TRUE
+      )
     )
   })
   
