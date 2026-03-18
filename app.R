@@ -85,7 +85,31 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
     )
 }
 
-canonicalize_receptor_value <- function(x) {
+# Strict parser for condition headers only
+canonicalize_receptor_token <- function(x) {
+  z <- x %>%
+    str_trim() %>%
+    str_to_lower() %>%
+    str_replace_all("[α]", "a") %>%
+    str_replace_all("[β]", "b") %>%
+    str_replace_all("[^a-z0-9\\s]", " ") %>%
+    str_squish()
+  
+  dplyr::case_when(
+    z %in% c("era", "er a", "esr1", "er1") ~ "era",
+    z %in% c("erb", "er b", "esr2", "er2") ~ "erb",
+    z %in% c("pgr", "pr", "prg") ~ "pgr",
+    z %in% c("pra", "pr a", "pr a isoform", "pr a iso") ~ "pra",
+    z %in% c("prb", "pr b", "pr b isoform", "pr b iso") ~ "prb",
+    z %in% c("ar", "androgen receptor", "nr3c4") ~ "AR",
+    z %in% c("gr", "glucocorticoid receptor", "nr3c1") ~ "GR",
+    z %in% c("mr", "mineralocorticoid receptor", "nr3c2") ~ "MR",
+    TRUE ~ NA_character_
+  )
+}
+
+# Looser parser for manual edits in the factor table
+canonicalize_receptor_edit <- function(x) {
   z <- x %>%
     str_trim() %>%
     str_to_lower() %>%
@@ -106,11 +130,6 @@ canonicalize_receptor_value <- function(x) {
     z %in% c("mr", "mineralocorticoid receptor", "nr3c2") ~ "MR",
     TRUE ~ str_trim(x)
   )
-}
-
-canonicalize_receptor_token <- function(x) {
-  out <- canonicalize_receptor_value(x)
-  if (identical(out, "none")) NA_character_ else out
 }
 
 is_vehicle_token <- function(x) {
@@ -271,7 +290,7 @@ plate_to_long_factor_map <- function(condition_df, receptor_df, treatment_df) {
     treatment = trts[keep]
   ) %>%
     mutate(
-      receptor = purrr::map_chr(receptor, canonicalize_receptor_value),
+      receptor = purrr::map_chr(receptor, canonicalize_receptor_edit),
       treatment = if_else(trimws(treatment) == "", "VEH", trimws(treatment)),
       receptor = factor(receptor),
       treatment = factor(treatment)
@@ -596,7 +615,7 @@ server <- function(input, output, session) {
       req(factor_map_default())
       factor_map_default() %>%
         mutate(
-          receptor = factor(purrr::map_chr(receptor, canonicalize_receptor_value)),
+          receptor = factor(purrr::map_chr(receptor, canonicalize_receptor_edit)),
           treatment = factor(if_else(trimws(treatment) == "", "VEH", trimws(treatment)))
         )
     }
