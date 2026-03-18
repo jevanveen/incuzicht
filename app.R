@@ -2,7 +2,7 @@
 # Incucyte Multi-File Import + Channel Normalization
 # - Passage parsed from header as surrogate biological replicate
 # - Auto-parse receptor + treatment from condition headers
-# - Editable factor editor using DT table
+# - Wide editable factor editor using rhandsontable
 # - Prism export with one row per elapsed time
 # - Plot defaults: facet by Passage; color by receptor
 
@@ -10,7 +10,7 @@ library(shiny)
 library(tidyverse)
 library(readr)
 library(stringr)
-library(DT)
+library(rhandsontable)
 
 # ---------------------------
 # Helpers
@@ -193,6 +193,44 @@ ols_control_adjust <- function(df, sig_col, ctl_col) {
   df
 }
 
+# make wide factor matrix: rows = factors, cols = condition headers
+make_wide_factor_map <- function(fm) {
+  conds <- fm$condition
+  tibble(
+    factor = c("receptor", "treatment")
+  ) %>%
+    bind_cols(
+      as_tibble(
+        rbind(
+          setNames(as.list(fm$receptor), conds),
+          setNames(as.list(fm$treatment), conds)
+        )
+      )
+    )
+}
+
+# wide back to long
+wide_to_long_factor_map <- function(df_wide) {
+  df_wide %>%
+    mutate(across(everything(), as.character)) %>%
+    pivot_longer(
+      cols = -factor,
+      names_to = "condition",
+      values_to = "value"
+    ) %>%
+    mutate(
+      value = trimws(value),
+      value = if_else(factor == "receptor" & value == "", "none", value),
+      value = if_else(factor == "treatment" & value == "", "VEH", value)
+    ) %>%
+    pivot_wider(names_from = factor, values_from = value) %>%
+    mutate(
+      receptor = factor(receptor),
+      treatment = factor(treatment)
+    ) %>%
+    arrange(condition)
+}
+
 # ---------------------------
 # UI
 # ---------------------------
@@ -227,8 +265,8 @@ ui <- fluidPage(
         tabPanel(
           "Factor editor",
           br(),
-          tags$p("Edit receptor and treatment assignments directly in the table, then click 'Apply edited factor assignments'."),
-          DTOutput("factor_editor_table")
+          tags$p("Wide factor table: columns are condition headers; row 1 = receptor; row 2 = treatment. Edit cells, copy/paste across cells if useful, then click 'Apply edited factor assignments'."),
+          rHandsontableOutput("factor_editor_table", height = "250px")
         ),
         tabPanel("Join checks", verbatimTextOutput("join_checks")),
         tabPanel("File preview", tableOutput("preview_files")),
@@ -391,71 +429,59 @@ server <- function(input, output, session) {
       arrange(condition)
   })
   
+  wide_factor_map_default <- reactive({
+    req(factor_map_default())
+    make_wide_factor_map(factor_map_default())
+  })
+  
   factor_map_rv <- reactiveVal(NULL)
   
-  observeEvent(factor_map_default(), {
-    factor_map_rv(factor_map_default())
+  observeEvent(wide_factor_map_default(), {
+    factor_map_rv(wide_factor_map_default())
   })
   
   observeEvent(input$reset_factor_map, {
-    req(factor_map_default())
-    factor_map_rv(factor_map_default())
+    req(wide_factor_map_default())
+    factor_map_rv(wide_factor_map_default())
   })
   
-  output$factor_editor_table <- renderDT({
+  output$factor_editor_table <- renderRHandsontable({
     req(factor_map_rv())
-    datatable(
-      factor_map_rv(),
-      rownames = FALSE,
-      editable = list(target = "cell", disable = list(columns = c(0))),
-      options = list(
-        pageLength = 25,
-        scrollX = TRUE
-      )
-    )
-  })
-  
-  observeEvent(input$factor_editor_table_cell_edit, {
-    req(factor_map_rv())
-    info <- input$factor_editor_table_cell_edit
     df <- factor_map_rv()
     
-    i <- info$row
-    j <- info$col
-    v <- info$value
-    
-    if (j == 1) {
-      df$receptor[i] <- trimws(v)
-      if (identical(df$receptor[i], "")) df$receptor[i] <- "none"
-    } else if (j == 2) {
-      df$treatment[i] <- trimws(v)
-      if (identical(df$treatment[i], "")) df$treatment[i] <- "VEH"
+    rhandsontable(
+      df,
+      rowHeaders = FALSE,
+      stretchH = "all",
+      height = 220
+    ) %>%
+      hot_col("factor", readOnly = TRUE) %>%
+      hot_table(highlightCol = TRUE, highlightRow = TRUE)
+  })
+  
+  observe({
+    if (!is.null(input$factor_editor_table)) {
+      tbl <- hot_to_r(input$factor_editor_table)
+      if (!is.null(tbl)) {
+        factor_map_rv(as_tibble(tbl))
+      }
     }
-    
-    factor_map_rv(df)
   })
   
   edited_factor_map <- reactiveVal(NULL)
   
   observeEvent(input$apply_factor_map, {
     req(factor_map_rv())
-    df <- factor_map_rv() %>%
-      mutate(
-        receptor = if_else(trimws(receptor) == "", "none", trimws(receptor)),
-        treatment = if_else(trimws(treatment) == "", "VEH", trimws(treatment)),
-        receptor = factor(receptor),
-        treatment = factor(treatment)
-      )
-    
-    edited_factor_map(df)
+    df_long <- wide_to_long_factor_map(factor_map_rv())
+    edited_factor_map(df_long)
   }, ignoreInit = TRUE)
   
   current_factor_map <- reactive({
     if (!is.null(edited_factor_map())) {
       edited_factor_map()
     } else {
-      req(factor_map_rv())
-      factor_map_rv() %>%
+      req(factor_map_default())
+      factor_map_default() %>%
         mutate(
           receptor = factor(if_else(trimws(receptor) == "", "none", trimws(receptor))),
           treatment = factor(if_else(trimws(treatment) == "", "VEH", trimws(treatment)))
@@ -506,7 +532,7 @@ server <- function(input, output, session) {
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
       factor_assignment_summary = factor_summary,
-      note = "Factor editor values come from the editable table. Click 'Apply edited factor assignments' after making changes."
+      note = "The factor editor starts from auto-guessed values and lets you overwrite them in a wide spreadsheet-like table."
     )
   })
   
