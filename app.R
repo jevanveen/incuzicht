@@ -7,6 +7,8 @@
 #     * Condition header plate (read-only)
 #     * Receptor plate (editable)
 #     * Treatment plate (editable)
+# - Matching across files/channels is based on parsed factors, not raw condition strings
+#   so it is insensitive to case/spacing differences in original headers
 # - Prism export with one row per elapsed time
 # - Plot defaults: facet by Passage; color by receptor
 
@@ -115,21 +117,45 @@ canonicalize_receptor_edit <- function(x) {
     str_to_lower() %>%
     str_replace_all("[α]", "a") %>%
     str_replace_all("[β]", "b") %>%
-    str_replace_all("[^a-z0-9\\s]", " ") %>%
+    str_replace_all("[^a-z0-9\\s+]", " ") %>%
     str_squish()
   
-  dplyr::case_when(
-    z %in% c("", "none", "na") ~ "none",
-    z %in% c("era", "er a", "esr1", "er1") ~ "era",
-    z %in% c("erb", "er b", "esr2", "er2") ~ "erb",
-    z %in% c("pgr", "pr", "prg") ~ "pgr",
-    z %in% c("pra", "pr a", "pr a isoform", "pr a iso") ~ "pra",
-    z %in% c("prb", "pr b", "pr b isoform", "pr b iso") ~ "prb",
-    z %in% c("ar", "androgen receptor", "nr3c4") ~ "AR",
-    z %in% c("gr", "glucocorticoid receptor", "nr3c1") ~ "GR",
-    z %in% c("mr", "mineralocorticoid receptor", "nr3c2") ~ "MR",
-    TRUE ~ str_trim(x)
-  )
+  if (z %in% c("", "none", "na")) return("none")
+  
+  parts <- str_split(z, "\\s*\\+\\s*", simplify = FALSE)[[1]]
+  parts <- purrr::map_chr(parts, function(p) {
+    dplyr::case_when(
+      p %in% c("era", "er a", "esr1", "er1") ~ "era",
+      p %in% c("erb", "er b", "esr2", "er2") ~ "erb",
+      p %in% c("pgr", "pr", "prg") ~ "pgr",
+      p %in% c("pra", "pr a", "pr a isoform", "pr a iso") ~ "pra",
+      p %in% c("prb", "pr b", "pr b isoform", "pr b iso") ~ "prb",
+      p %in% c("ar", "androgen receptor", "nr3c4") ~ "AR",
+      p %in% c("gr", "glucocorticoid receptor", "nr3c1") ~ "GR",
+      p %in% c("mr", "mineralocorticoid receptor", "nr3c2") ~ "MR",
+      TRUE ~ str_trim(p)
+    )
+  })
+  
+  parts <- unique(parts[parts != ""])
+  if (length(parts) == 0) "none" else paste(parts, collapse = " + ")
+}
+
+canonicalize_treatment_edit <- function(x) {
+  z <- str_trim(as.character(x))
+  if (identical(z, "") || is.na(z)) "VEH" else z
+}
+
+normalize_factor_key <- function(x) {
+  x %>%
+    as.character() %>%
+    str_to_lower() %>%
+    str_replace_all("\\s+", " ") %>%
+    str_squish()
+}
+
+make_factor_key <- function(receptor, treatment) {
+  paste(normalize_factor_key(receptor), normalize_factor_key(treatment), sep = " || ")
 }
 
 is_vehicle_token <- function(x) {
@@ -291,7 +317,8 @@ plate_to_long_factor_map <- function(condition_df, receptor_df, treatment_df) {
   ) %>%
     mutate(
       receptor = purrr::map_chr(receptor, canonicalize_receptor_edit),
-      treatment = if_else(trimws(treatment) == "", "VEH", trimws(treatment)),
+      treatment = purrr::map_chr(treatment, canonicalize_treatment_edit),
+      factor_key = make_factor_key(receptor, treatment),
       receptor = factor(receptor),
       treatment = factor(treatment)
     ) %>%
@@ -449,15 +476,12 @@ server <- function(input, output, session) {
       ),
       checkboxInput(
         "baseline_norm",
-        "Also baseline-normalize within Passage+Condition (divide by first non-NA timepoint)",
+        "Also baseline-normalize within Passage+Factor combination (divide by first non-NA timepoint)",
         value = FALSE
       )
     )
   })
   
-  # ---------------------------
-  # Imported data with auto-guessed factors
-  # ---------------------------
   raw_long_auto <- eventReactive(input$run, {
     cm <- channel_map()
     
@@ -488,18 +512,20 @@ server <- function(input, output, session) {
       left_join(annot, by = c("condition" = "condition_raw")) %>%
       mutate(
         receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
-        treatment = forcats::fct_explicit_na(treatment, na_level = "VEH")
+        treatment = forcats::fct_explicit_na(treatment, na_level = "VEH"),
+        factor_key = make_factor_key(receptor, treatment)
       ) %>%
-      relocate(receptor, treatment, .after = condition)
+      relocate(receptor, treatment, factor_key, .after = condition)
   }, ignoreInit = TRUE)
   
   factor_map_default <- reactive({
     req(raw_long_auto())
     raw_long_auto() %>%
-      distinct(condition, receptor, treatment) %>%
+      distinct(condition, receptor, treatment, factor_key) %>%
       mutate(
         receptor = as.character(receptor),
-        treatment = as.character(treatment)
+        treatment = as.character(treatment),
+        factor_key = as.character(factor_key)
       ) %>%
       arrange(condition)
   })
@@ -616,7 +642,8 @@ server <- function(input, output, session) {
       factor_map_default() %>%
         mutate(
           receptor = factor(purrr::map_chr(receptor, canonicalize_receptor_edit)),
-          treatment = factor(if_else(trimws(treatment) == "", "VEH", trimws(treatment)))
+          treatment = factor(purrr::map_chr(treatment, canonicalize_treatment_edit)),
+          factor_key = make_factor_key(receptor, treatment)
         )
     }
   })
@@ -625,13 +652,14 @@ server <- function(input, output, session) {
     req(raw_long_auto(), current_factor_map())
     
     raw_long_auto() %>%
-      select(-receptor, -treatment) %>%
+      select(-receptor, -treatment, -factor_key) %>%
       left_join(current_factor_map(), by = "condition") %>%
       mutate(
         receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
-        treatment = forcats::fct_explicit_na(treatment, na_level = "VEH")
+        treatment = forcats::fct_explicit_na(treatment, na_level = "VEH"),
+        factor_key = make_factor_key(receptor, treatment)
       ) %>%
-      relocate(receptor, treatment, .after = condition)
+      relocate(receptor, treatment, factor_key, .after = condition)
   })
   
   output$join_checks <- renderPrint({
@@ -647,15 +675,16 @@ server <- function(input, output, session) {
       summarize(
         n_rows = n(),
         n_passages = n_distinct(passage),
-        n_conditions = n_distinct(condition),
+        n_factor_keys = n_distinct(factor_key),
         n_times = n_distinct(elapsed),
         .groups = "drop"
       )
     
     factor_summary <- rl %>%
-      distinct(condition, receptor, treatment) %>%
+      distinct(condition, receptor, treatment, factor_key) %>%
       summarize(
         n_conditions = n(),
+        n_unique_factor_keys = n_distinct(factor_key),
         receptor_levels = paste(sort(unique(as.character(receptor))), collapse = ", "),
         treatment_levels = paste(sort(unique(as.character(treatment))), collapse = ", ")
       )
@@ -664,15 +693,15 @@ server <- function(input, output, session) {
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
       factor_assignment_summary = factor_summary,
-      note = "Factor editor starts from auto-guessed values, auto-detects plate size, and displays conditions in plate-equivalent layout."
+      note = "Files/channels are matched by parsed factor combination (receptor + treatment), not raw condition header. This makes matching insensitive to case and spacing."
     )
   })
   
   wide_joined_passage <- reactive({
     req(raw_long())
     raw_long() %>%
-      select(passage, channel, elapsed, condition, receptor, treatment, value) %>%
-      group_by(passage, channel, elapsed, condition, receptor, treatment) %>%
+      select(passage, channel, elapsed, receptor, treatment, factor_key, value) %>%
+      group_by(passage, channel, elapsed, receptor, treatment, factor_key) %>%
       summarize(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
       pivot_wider(names_from = channel, values_from = value)
   })
@@ -703,7 +732,7 @@ server <- function(input, output, session) {
         )
     } else if (method == "ols_adj") {
       out <- out %>%
-        group_by(passage, condition) %>%
+        group_by(passage, factor_key) %>%
         group_modify(~ ols_control_adjust(.x, sig_col = sig, ctl_col = ctl)) %>%
         ungroup()
     } else {
@@ -712,7 +741,7 @@ server <- function(input, output, session) {
     
     if (isTRUE(input$baseline_norm)) {
       out <- out %>%
-        group_by(passage, condition) %>%
+        group_by(passage, factor_key) %>%
         mutate(
           baseline = value_norm[which(!is.na(value_norm))[1]],
           value_norm = value_norm / baseline
@@ -736,8 +765,8 @@ server <- function(input, output, session) {
         receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
         treatment = forcats::fct_explicit_na(treatment, na_level = "VEH")
       ) %>%
-      select(passage, elapsed, condition, receptor, treatment, value_norm) %>%
-      arrange(receptor, treatment, passage, condition, elapsed)
+      select(passage, elapsed, receptor, treatment, factor_key, value_norm) %>%
+      arrange(receptor, treatment, passage, elapsed)
   })
   
   prism_wide <- reactive({
@@ -773,7 +802,7 @@ server <- function(input, output, session) {
       return()
     }
     
-    ggplot(df, aes(x = elapsed, y = value_norm, group = condition, color = receptor)) +
+    ggplot(df, aes(x = elapsed, y = value_norm, group = factor_key, color = receptor)) +
       geom_line(alpha = 0.6, na.rm = TRUE) +
       facet_wrap(~ passage) +
       labs(
