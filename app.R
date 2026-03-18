@@ -2,7 +2,11 @@
 # Incucyte Multi-File Import + Channel Normalization
 # - Passage parsed from header as surrogate biological replicate
 # - Auto-parse receptor + treatment from condition headers
-# - Wide editable factor editor using rhandsontable
+# - Plate size auto-detected from number of unique condition headers
+# - Factor editor shown in plate-equivalent layout using rhandsontable:
+#     * Condition header plate (read-only)
+#     * Receptor plate (editable)
+#     * Treatment plate (editable)
 # - Prism export with one row per elapsed time
 # - Plot defaults: facet by Passage; color by receptor
 
@@ -15,6 +19,8 @@ library(rhandsontable)
 # ---------------------------
 # Helpers
 # ---------------------------
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
 find_data_header_row <- function(lines) {
   idx <- which(str_detect(lines, "^Date Time\\tElapsed\\b"))
   if (length(idx) == 0) return(NA_integer_)
@@ -79,8 +85,9 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
     )
 }
 
-canonicalize_receptor_token <- function(x) {
+canonicalize_receptor_value <- function(x) {
   z <- x %>%
+    str_trim() %>%
     str_to_lower() %>%
     str_replace_all("[α]", "a") %>%
     str_replace_all("[β]", "b") %>%
@@ -88,14 +95,22 @@ canonicalize_receptor_token <- function(x) {
     str_squish()
   
   dplyr::case_when(
+    z %in% c("", "none", "na") ~ "none",
     z %in% c("era", "er a", "esr1", "er1") ~ "era",
     z %in% c("erb", "er b", "esr2", "er2") ~ "erb",
     z %in% c("pgr", "pr", "prg") ~ "pgr",
-    z %in% c("pra", "pr a", "pr-a", "pr a isoform", "pr a iso") ~ "pra",
-    z %in% c("prb", "pr b", "pr-b", "pr b isoform", "pr b iso") ~ "prb",
-    z %in% c("gr", "nr3c1", "glucocorticoid receptor") ~ "gr",
-    TRUE ~ NA_character_
+    z %in% c("pra", "pr a", "pr a isoform", "pr a iso") ~ "pra",
+    z %in% c("prb", "pr b", "pr b isoform", "pr b iso") ~ "prb",
+    z %in% c("ar", "androgen receptor", "nr3c4") ~ "AR",
+    z %in% c("gr", "glucocorticoid receptor", "nr3c1") ~ "GR",
+    z %in% c("mr", "mineralocorticoid receptor", "nr3c2") ~ "MR",
+    TRUE ~ str_trim(x)
   )
+}
+
+canonicalize_receptor_token <- function(x) {
+  out <- canonicalize_receptor_value(x)
+  if (identical(out, "none")) NA_character_ else out
 }
 
 is_vehicle_token <- function(x) {
@@ -119,7 +134,7 @@ parse_treatment_token <- function(x) {
 }
 
 canonicalize_receptor_combo <- function(receptors) {
-  order <- c("none", "era", "erb", "pgr", "pra", "prb", "gr")
+  order <- c("none", "era", "erb", "pgr", "pra", "prb", "AR", "GR", "MR")
   recs <- unique(na.omit(receptors))
   if (length(recs) == 0) return("none")
   recs <- recs[order(match(recs, order, nomatch = 999))]
@@ -193,38 +208,71 @@ ols_control_adjust <- function(df, sig_col, ctl_col) {
   df
 }
 
-# make wide factor matrix: rows = factors, cols = condition headers
-make_wide_factor_map <- function(fm) {
-  conds <- fm$condition
-  tibble(
-    factor = c("receptor", "treatment")
-  ) %>%
-    bind_cols(
-      as_tibble(
-        rbind(
-          setNames(as.list(fm$receptor), conds),
-          setNames(as.list(fm$treatment), conds)
-        )
-      )
+# ---------------------------
+# Plate layout helpers
+# ---------------------------
+detect_plate_layout <- function(n) {
+  standard <- tibble(
+    plate_size = c(6, 12, 24, 48, 96),
+    n_rows = c(2, 3, 4, 6, 8),
+    n_cols = c(3, 4, 6, 8, 12)
+  )
+  
+  hit <- standard %>% filter(plate_size >= n) %>% slice(1)
+  
+  if (nrow(hit) == 0) {
+    n_rows <- ceiling(sqrt(n))
+    n_cols <- ceiling(n / n_rows)
+    tibble(
+      plate_size = n,
+      n_rows = n_rows,
+      n_cols = n_cols
     )
+  } else {
+    hit
+  }
 }
 
-# wide back to long
-wide_to_long_factor_map <- function(df_wide) {
-  df_wide %>%
-    mutate(across(everything(), as.character)) %>%
-    pivot_longer(
-      cols = -factor,
-      names_to = "condition",
-      values_to = "value"
-    ) %>%
+make_plate_df <- function(values, n_rows, n_cols, fill = "") {
+  total <- n_rows * n_cols
+  vals <- c(as.character(values), rep(fill, max(0, total - length(values))))
+  mat <- matrix(vals, nrow = n_rows, ncol = n_cols, byrow = TRUE)
+  df <- as.data.frame(mat, stringsAsFactors = FALSE, check.names = FALSE)
+  names(df) <- as.character(seq_len(n_cols))
+  rownames(df) <- LETTERS[seq_len(n_rows)]
+  df
+}
+
+flatten_plate_df <- function(df) {
+  as.vector(t(as.matrix(df)))
+}
+
+make_plate_factor_map <- function(fm_long, layout) {
+  n_rows <- layout$n_rows[[1]]
+  n_cols <- layout$n_cols[[1]]
+  
+  list(
+    condition_df = make_plate_df(fm_long$condition, n_rows, n_cols, fill = ""),
+    receptor_df  = make_plate_df(fm_long$receptor, n_rows, n_cols, fill = "none"),
+    treatment_df = make_plate_df(fm_long$treatment, n_rows, n_cols, fill = "VEH")
+  )
+}
+
+plate_to_long_factor_map <- function(condition_df, receptor_df, treatment_df) {
+  conds <- flatten_plate_df(condition_df)
+  recs  <- flatten_plate_df(receptor_df)
+  trts  <- flatten_plate_df(treatment_df)
+  
+  keep <- trimws(conds) != ""
+  
+  tibble(
+    condition = conds[keep],
+    receptor = recs[keep],
+    treatment = trts[keep]
+  ) %>%
     mutate(
-      value = trimws(value),
-      value = if_else(factor == "receptor" & value == "", "none", value),
-      value = if_else(factor == "treatment" & value == "", "VEH", value)
-    ) %>%
-    pivot_wider(names_from = factor, values_from = value) %>%
-    mutate(
+      receptor = purrr::map_chr(receptor, canonicalize_receptor_value),
+      treatment = if_else(trimws(treatment) == "", "VEH", trimws(treatment)),
       receptor = factor(receptor),
       treatment = factor(treatment)
     ) %>%
@@ -265,8 +313,16 @@ ui <- fluidPage(
         tabPanel(
           "Factor editor",
           br(),
-          tags$p("Wide factor table: columns are condition headers; row 1 = receptor; row 2 = treatment. Edit cells, copy/paste across cells if useful, then click 'Apply edited factor assignments'."),
-          rHandsontableOutput("factor_editor_table", height = "250px")
+          uiOutput("plate_info"),
+          tags$p("Edit receptor and treatment in plate layout. Condition header plate is read-only."),
+          h4("Condition headers"),
+          rHandsontableOutput("condition_plate", height = "240px"),
+          br(),
+          h4("Receptor"),
+          rHandsontableOutput("receptor_plate", height = "240px"),
+          br(),
+          h4("Treatment"),
+          rHandsontableOutput("treatment_plate", height = "240px")
         ),
         tabPanel("Join checks", verbatimTextOutput("join_checks")),
         tabPanel("File preview", tableOutput("preview_files")),
@@ -429,41 +485,92 @@ server <- function(input, output, session) {
       arrange(condition)
   })
   
-  wide_factor_map_default <- reactive({
+  plate_layout <- reactive({
     req(factor_map_default())
-    make_wide_factor_map(factor_map_default())
+    detect_plate_layout(nrow(factor_map_default()))
   })
   
-  factor_map_rv <- reactiveVal(NULL)
+  output$plate_info <- renderUI({
+    req(plate_layout())
+    layout <- plate_layout()
+    tags$p(
+      tags$b("Detected plate layout: "),
+      paste0(layout$plate_size[[1]], "-well equivalent (",
+             layout$n_rows[[1]], " rows × ",
+             layout$n_cols[[1]], " columns)")
+    )
+  })
   
-  observeEvent(wide_factor_map_default(), {
-    factor_map_rv(wide_factor_map_default())
+  condition_plate_rv <- reactiveVal(NULL)
+  receptor_plate_rv  <- reactiveVal(NULL)
+  treatment_plate_rv <- reactiveVal(NULL)
+  
+  observeEvent(list(factor_map_default(), plate_layout()), {
+    pm <- make_plate_factor_map(factor_map_default(), plate_layout())
+    condition_plate_rv(pm$condition_df)
+    receptor_plate_rv(pm$receptor_df)
+    treatment_plate_rv(pm$treatment_df)
   })
   
   observeEvent(input$reset_factor_map, {
-    req(wide_factor_map_default())
-    factor_map_rv(wide_factor_map_default())
+    req(factor_map_default(), plate_layout())
+    pm <- make_plate_factor_map(factor_map_default(), plate_layout())
+    condition_plate_rv(pm$condition_df)
+    receptor_plate_rv(pm$receptor_df)
+    treatment_plate_rv(pm$treatment_df)
   })
   
-  output$factor_editor_table <- renderRHandsontable({
-    req(factor_map_rv())
-    df <- factor_map_rv()
-    
+  output$condition_plate <- renderRHandsontable({
+    req(condition_plate_rv())
     rhandsontable(
-      df,
-      rowHeaders = FALSE,
+      condition_plate_rv(),
+      rowHeaders = rownames(condition_plate_rv()),
       stretchH = "all",
       height = 220
     ) %>%
-      hot_col("factor", readOnly = TRUE) %>%
+      hot_table(readOnly = TRUE, highlightCol = TRUE, highlightRow = TRUE)
+  })
+  
+  output$receptor_plate <- renderRHandsontable({
+    req(receptor_plate_rv())
+    rhandsontable(
+      receptor_plate_rv(),
+      rowHeaders = rownames(receptor_plate_rv()),
+      stretchH = "all",
+      height = 220
+    ) %>%
+      hot_table(highlightCol = TRUE, highlightRow = TRUE)
+  })
+  
+  output$treatment_plate <- renderRHandsontable({
+    req(treatment_plate_rv())
+    rhandsontable(
+      treatment_plate_rv(),
+      rowHeaders = rownames(treatment_plate_rv()),
+      stretchH = "all",
+      height = 220
+    ) %>%
       hot_table(highlightCol = TRUE, highlightRow = TRUE)
   })
   
   observe({
-    if (!is.null(input$factor_editor_table)) {
-      tbl <- hot_to_r(input$factor_editor_table)
+    if (!is.null(input$receptor_plate)) {
+      tbl <- hot_to_r(input$receptor_plate)
       if (!is.null(tbl)) {
-        factor_map_rv(as_tibble(tbl))
+        tbl <- as.data.frame(tbl, stringsAsFactors = FALSE, check.names = FALSE)
+        rownames(tbl) <- rownames(receptor_plate_rv() %||% tbl)
+        receptor_plate_rv(tbl)
+      }
+    }
+  })
+  
+  observe({
+    if (!is.null(input$treatment_plate)) {
+      tbl <- hot_to_r(input$treatment_plate)
+      if (!is.null(tbl)) {
+        tbl <- as.data.frame(tbl, stringsAsFactors = FALSE, check.names = FALSE)
+        rownames(tbl) <- rownames(treatment_plate_rv() %||% tbl)
+        treatment_plate_rv(tbl)
       }
     }
   })
@@ -471,8 +578,14 @@ server <- function(input, output, session) {
   edited_factor_map <- reactiveVal(NULL)
   
   observeEvent(input$apply_factor_map, {
-    req(factor_map_rv())
-    df_long <- wide_to_long_factor_map(factor_map_rv())
+    req(condition_plate_rv(), receptor_plate_rv(), treatment_plate_rv())
+    
+    df_long <- plate_to_long_factor_map(
+      condition_df = condition_plate_rv(),
+      receptor_df  = receptor_plate_rv(),
+      treatment_df = treatment_plate_rv()
+    )
+    
     edited_factor_map(df_long)
   }, ignoreInit = TRUE)
   
@@ -483,7 +596,7 @@ server <- function(input, output, session) {
       req(factor_map_default())
       factor_map_default() %>%
         mutate(
-          receptor = factor(if_else(trimws(receptor) == "", "none", trimws(receptor))),
+          receptor = factor(purrr::map_chr(receptor, canonicalize_receptor_value)),
           treatment = factor(if_else(trimws(treatment) == "", "VEH", trimws(treatment)))
         )
     }
@@ -532,7 +645,7 @@ server <- function(input, output, session) {
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
       factor_assignment_summary = factor_summary,
-      note = "The factor editor starts from auto-guessed values and lets you overwrite them in a wide spreadsheet-like table."
+      note = "Factor editor starts from auto-guessed values, auto-detects plate size, and displays conditions in plate-equivalent layout."
     )
   })
   
