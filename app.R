@@ -14,6 +14,7 @@
 #     ar  -> AR
 #     gr  -> GR
 #     mr  -> MR
+# - Factor editor includes n_reps = number of unique imported files contributing each condition
 # - Prism export with one row per elapsed time
 # - Plot defaults: facet by Passage; color by receptor
 
@@ -95,7 +96,6 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
 # ---------------------------
 # Receptor / treatment parsing
 # ---------------------------
-# Strict parser for condition headers only
 canonicalize_receptor_token <- function(x) {
   z <- x %>%
     str_trim() %>%
@@ -118,7 +118,6 @@ canonicalize_receptor_token <- function(x) {
   )
 }
 
-# Looser parser for manual edits
 canonicalize_receptor_edit <- function(x) {
   z <- x %>%
     str_trim() %>%
@@ -454,12 +453,19 @@ server <- function(input, output, session) {
   
   factor_map_default <- reactive({
     req(raw_long_auto())
+    
+    rep_counts <- raw_long_auto() %>%
+      distinct(condition, file) %>%
+      count(condition, name = "n_reps")
+    
     raw_long_auto() %>%
       distinct(condition, receptor, treatment, factor_key) %>%
+      left_join(rep_counts, by = "condition") %>%
       mutate(
         receptor = as.character(receptor),
         treatment = as.character(treatment),
-        factor_key = as.character(factor_key)
+        factor_key = as.character(factor_key),
+        n_reps = as.integer(n_reps)
       ) %>%
       arrange(condition)
   })
@@ -478,7 +484,7 @@ server <- function(input, output, session) {
   output$factor_editor_table <- renderRHandsontable({
     req(factor_map_rv())
     df <- factor_map_rv() %>%
-      select(condition, receptor, treatment)
+      select(condition, n_reps, receptor, treatment)
     
     rhandsontable(
       df,
@@ -487,6 +493,7 @@ server <- function(input, output, session) {
       height = 500
     ) %>%
       hot_col("condition", readOnly = TRUE) %>%
+      hot_col("n_reps", readOnly = TRUE) %>%
       hot_table(highlightCol = TRUE, highlightRow = TRUE)
   })
   
@@ -497,6 +504,7 @@ server <- function(input, output, session) {
         tbl <- as_tibble(tbl) %>%
           mutate(
             condition = as.character(condition),
+            n_reps = suppressWarnings(as.integer(n_reps)),
             receptor = as.character(receptor),
             treatment = as.character(treatment)
           )
@@ -542,7 +550,7 @@ server <- function(input, output, session) {
     
     raw_long_auto() %>%
       select(-receptor, -treatment, -factor_key) %>%
-      left_join(current_factor_map(), by = "condition") %>%
+      left_join(current_factor_map() %>% select(condition, receptor, treatment, factor_key), by = "condition") %>%
       mutate(
         receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
         treatment = forcats::fct_explicit_na(treatment, na_level = "VEH"),
@@ -582,11 +590,10 @@ server <- function(input, output, session) {
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
       factor_assignment_summary = factor_summary,
-      note = "Files/channels are matched by parsed factor combination (receptor + treatment), not raw condition header. Factor editor is long-format for easier spreadsheet editing."
+      note = "Files/channels are matched by parsed factor combination (receptor + treatment), not raw condition header. Factor editor now includes n_reps = number of imported files contributing each condition."
     )
   })
   
-  # Match channels using parsed factors, not raw condition strings
   wide_joined_passage <- reactive({
     req(raw_long())
     raw_long() %>%
