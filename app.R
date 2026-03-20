@@ -5,6 +5,7 @@
 # - Matching across files/channels is based on parsed factors, not raw condition strings
 #   so it is insensitive to case/spacing differences in original headers
 # - Factor editor uses rhandsontable in LONG format (spreadsheet-like, easy to drag/fill)
+# - Passage is also editable via a separate rhandsontable
 # - Receptor canonical names after parsing:
 #     era -> ER_a
 #     erb -> ER_b
@@ -15,9 +16,11 @@
 #     gr  -> GR
 #     mr  -> MR
 # - Factor editor includes n_reps = number of unique imported files contributing each condition
-# - Plot tab includes filters for elapsed-time range, receptor levels, and treatment levels
-# - Prism export with one row per elapsed time
-# - Plot defaults: facet by Passage; color by receptor
+# - Plot tab includes:
+#     * filtered timecourse plot
+#     * combined preview AUC plot for the current filter window
+# - Prism export uses AUC values over the currently selected plot/filter window
+#   formatted as rows = receptor, columns grouped by treatment, one column per replicate
 
 library(shiny)
 library(tidyverse)
@@ -80,8 +83,8 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
   
   dat %>%
     mutate(
-      datetime = as.character(datetime),
-      elapsed  = suppressWarnings(as.numeric(elapsed))
+      datetime  = as.character(datetime),
+      elapsed   = suppressWarnings(as.numeric(elapsed))
     ) %>%
     pivot_longer(
       cols = -c(datetime, elapsed),
@@ -153,6 +156,11 @@ canonicalize_receptor_edit <- function(x) {
 canonicalize_treatment_edit <- function(x) {
   z <- str_trim(as.character(x))
   if (identical(z, "") || is.na(z)) "VEH" else z
+}
+
+canonicalize_passage_edit <- function(x) {
+  z <- str_trim(as.character(x))
+  if (identical(z, "") || is.na(z)) "Passage_NA" else z
 }
 
 normalize_factor_key <- function(x) {
@@ -264,6 +272,20 @@ ols_control_adjust <- function(df, sig_col, ctl_col) {
   df
 }
 
+auc_trapz <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  x <- x[ok]
+  y <- y[ok]
+  
+  if (length(x) < 2) return(NA_real_)
+  
+  ord <- order(x)
+  x <- x[ord]
+  y <- y[ord]
+  
+  sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
 # ---------------------------
 # UI
 # ---------------------------
@@ -283,20 +305,24 @@ ui <- fluidPage(
       uiOutput("norm_ui"),
       actionButton("run", "Import + Process", class = "btn-primary"),
       hr(),
-      h4("Factor editing"),
+      h4("Editing"),
       actionButton("reset_factor_map", "Reset factor assignments"),
-      actionButton("apply_factor_map", "Apply edited factor assignments", class = "btn-primary"),
+      actionButton("reset_passage_map", "Reset passage assignments"),
+      actionButton("apply_factor_map", "Apply edits", class = "btn-primary"),
       hr(),
       h4("Downloads"),
       downloadButton("download_factor_map", "Factor assignments (csv)"),
+      downloadButton("download_passage_map", "Passage assignments (csv)"),
       downloadButton("download_norm", "Normalized by Passage (csv)"),
-      downloadButton("download_prism", "Prism wide export (csv)")
+      downloadButton("download_prism", "Prism AUC export (csv)")
     ),
     mainPanel(
       tabsetPanel(
         tabPanel(
           "Plot",
-          plotOutput("plot", height = 460),
+          plotOutput("plot", height = 420),
+          br(),
+          plotOutput("auc_plot", height = 340),
           br(),
           fluidRow(
             column(4, uiOutput("plot_time_ui")),
@@ -307,8 +333,11 @@ ui <- fluidPage(
         tabPanel(
           "Factor editor",
           br(),
-          tags$p("Long-format factor table. You can edit, copy, and drag-fill cells in the spreadsheet, then click 'Apply edited factor assignments'."),
-          rHandsontableOutput("factor_editor_table", height = "520px")
+          tags$p("Condition-level factors. You can edit, copy, and drag-fill cells, then click 'Apply edits'."),
+          rHandsontableOutput("factor_editor_table", height = "420px"),
+          br(),
+          tags$p("Passage labels are also editable. This lets you rename or merge passage groups before plotting/export."),
+          rHandsontableOutput("passage_editor_table", height = "240px")
         ),
         tabPanel("Join checks", verbatimTextOutput("join_checks")),
         tabPanel("File preview", tableOutput("preview_files")),
@@ -439,14 +468,15 @@ server <- function(input, output, session) {
         mutate(
           file = file,
           channel = channel,
-          passage = factor(passage_lab),
+          passage_raw = passage_lab,
+          passage = passage_lab,
           vessel_name = meta$vessel_name[[1]] %||% NA_character_,
           metric      = meta$metric[[1]] %||% NA_character_,
           cell_type   = meta$cell_type[[1]] %||% NA_character_,
           analysis    = meta$analysis[[1]] %||% NA_character_
         )
     }) %>%
-      select(file, channel, passage, vessel_name, metric, cell_type, analysis,
+      select(file, channel, passage_raw, passage, vessel_name, metric, cell_type, analysis,
              datetime, elapsed, condition, value)
     
     annot <- guess_receptor_treatment(unique(dat$condition))
@@ -480,15 +510,38 @@ server <- function(input, output, session) {
       arrange(condition)
   })
   
+  passage_map_default <- reactive({
+    req(raw_long_auto())
+    
+    raw_long_auto() %>%
+      distinct(file, passage_raw) %>%
+      count(passage_raw, name = "n_files") %>%
+      mutate(
+        passage = passage_raw,
+        n_files = as.integer(n_files)
+      ) %>%
+      arrange(passage_raw)
+  })
+  
   factor_map_rv <- reactiveVal(NULL)
+  passage_map_rv <- reactiveVal(NULL)
   
   observeEvent(factor_map_default(), {
     factor_map_rv(factor_map_default())
   })
   
+  observeEvent(passage_map_default(), {
+    passage_map_rv(passage_map_default())
+  })
+  
   observeEvent(input$reset_factor_map, {
     req(factor_map_default())
     factor_map_rv(factor_map_default())
+  })
+  
+  observeEvent(input$reset_passage_map, {
+    req(passage_map_default())
+    passage_map_rv(passage_map_default())
   })
   
   output$factor_editor_table <- renderRHandsontable({
@@ -500,10 +553,26 @@ server <- function(input, output, session) {
       df,
       rowHeaders = NULL,
       stretchH = "all",
-      height = 500
+      height = 400
     ) %>%
       hot_col("condition", readOnly = TRUE) %>%
       hot_col("n_reps", readOnly = TRUE) %>%
+      hot_table(highlightCol = TRUE, highlightRow = TRUE)
+  })
+  
+  output$passage_editor_table <- renderRHandsontable({
+    req(passage_map_rv())
+    df <- passage_map_rv() %>%
+      select(passage_raw, n_files, passage)
+    
+    rhandsontable(
+      df,
+      rowHeaders = NULL,
+      stretchH = "all",
+      height = 220
+    ) %>%
+      hot_col("passage_raw", readOnly = TRUE) %>%
+      hot_col("n_files", readOnly = TRUE) %>%
       hot_table(highlightCol = TRUE, highlightRow = TRUE)
   })
   
@@ -514,8 +583,8 @@ server <- function(input, output, session) {
         tbl <- as_tibble(tbl) %>%
           mutate(
             condition = as.character(condition),
-            n_reps = suppressWarnings(as.integer(n_reps)),
-            receptor = as.character(receptor),
+            n_reps    = suppressWarnings(as.integer(n_reps)),
+            receptor  = as.character(receptor),
             treatment = as.character(treatment)
           )
         factor_map_rv(tbl)
@@ -523,12 +592,28 @@ server <- function(input, output, session) {
     }
   })
   
+  observe({
+    if (!is.null(input$passage_editor_table)) {
+      tbl <- hot_to_r(input$passage_editor_table)
+      if (!is.null(tbl)) {
+        tbl <- as_tibble(tbl) %>%
+          mutate(
+            passage_raw = as.character(passage_raw),
+            n_files = suppressWarnings(as.integer(n_files)),
+            passage = as.character(passage)
+          )
+        passage_map_rv(tbl)
+      }
+    }
+  })
+  
   edited_factor_map <- reactiveVal(NULL)
+  edited_passage_map <- reactiveVal(NULL)
   
   observeEvent(input$apply_factor_map, {
-    req(factor_map_rv())
+    req(factor_map_rv(), passage_map_rv())
     
-    df_long <- factor_map_rv() %>%
+    df_factor <- factor_map_rv() %>%
       mutate(
         receptor = purrr::map_chr(receptor, canonicalize_receptor_edit),
         treatment = purrr::map_chr(treatment, canonicalize_treatment_edit),
@@ -538,7 +623,14 @@ server <- function(input, output, session) {
       ) %>%
       arrange(condition)
     
-    edited_factor_map(df_long)
+    df_passage <- passage_map_rv() %>%
+      mutate(
+        passage = purrr::map_chr(passage, canonicalize_passage_edit)
+      ) %>%
+      arrange(passage_raw)
+    
+    edited_factor_map(df_factor)
+    edited_passage_map(df_passage)
   }, ignoreInit = TRUE)
   
   current_factor_map <- reactive({
@@ -555,15 +647,29 @@ server <- function(input, output, session) {
     }
   })
   
+  current_passage_map <- reactive({
+    if (!is.null(edited_passage_map())) {
+      edited_passage_map()
+    } else {
+      req(passage_map_default())
+      passage_map_default() %>%
+        mutate(
+          passage = purrr::map_chr(passage, canonicalize_passage_edit)
+        )
+    }
+  })
+  
   raw_long <- reactive({
-    req(raw_long_auto(), current_factor_map())
+    req(raw_long_auto(), current_factor_map(), current_passage_map())
     
     raw_long_auto() %>%
-      select(-receptor, -treatment, -factor_key) %>%
+      select(-receptor, -treatment, -factor_key, -passage) %>%
       left_join(current_factor_map() %>% select(condition, receptor, treatment, factor_key), by = "condition") %>%
+      left_join(current_passage_map() %>% select(passage_raw, passage), by = "passage_raw") %>%
       mutate(
         receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
         treatment = forcats::fct_explicit_na(treatment, na_level = "VEH"),
+        passage = factor(passage),
         factor_key = make_factor_key(receptor, treatment)
       ) %>%
       relocate(receptor, treatment, factor_key, .after = condition)
@@ -574,7 +680,7 @@ server <- function(input, output, session) {
     rl <- raw_long()
     
     files_loaded <- rl %>%
-      distinct(file, channel, passage, vessel_name, metric, cell_type, analysis) %>%
+      distinct(file, channel, passage_raw, passage, vessel_name, metric, cell_type, analysis) %>%
       arrange(passage, channel, file)
     
     per_channel <- rl %>%
@@ -600,11 +706,10 @@ server <- function(input, output, session) {
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
       factor_assignment_summary = factor_summary,
-      note = "Files/channels are matched by parsed factor combination (receptor + treatment), not raw condition header. Factor editor now includes n_reps = number of imported files contributing each condition."
+      note = "Files/channels are matched by parsed factor combination (receptor + treatment). Passage labels are editable and can be merged or renamed."
     )
   })
   
-  # Match channels using parsed factors, not raw condition strings
   wide_joined_passage <- reactive({
     req(raw_long())
     raw_long() %>%
@@ -728,38 +833,9 @@ server <- function(input, output, session) {
     )
   })
   
-  prism_wide <- reactive({
-    req(stats_long())
-    df <- stats_long() %>%
-      group_by(elapsed, receptor, treatment, passage) %>%
-      summarize(value = mean(value_norm, na.rm = TRUE), .groups = "drop") %>%
-      mutate(col_key = paste(receptor, treatment, passage, sep = "__"))
-    
-    wide <- df %>%
-      select(elapsed, col_key, value) %>%
-      pivot_wider(names_from = col_key, values_from = value)
-    
-    col_meta <- df %>%
-      distinct(col_key, receptor, treatment, passage) %>%
-      arrange(receptor, treatment, passage)
-    
-    wide %>% select(elapsed, any_of(col_meta$col_key))
-  })
-  
-  output$preview_prism <- renderTable({
-    req(prism_wide())
-    head(prism_wide(), 20)
-  }, striped = TRUE)
-  
-  output$plot <- renderPlot({
+  filtered_stats_long <- reactive({
     req(stats_long())
     df <- stats_long()
-    
-    if (all(is.na(df$value_norm))) {
-      plot.new()
-      text(0.5, 0.5, "No normalized values to plot yet.\nUpload files, assign channels, choose signal/control, click 'Import + Process'.")
-      return()
-    }
     
     if (!is.null(input$plot_time_range)) {
       df <- df %>%
@@ -779,7 +855,56 @@ server <- function(input, output, session) {
         filter(as.character(treatment) %in% input$plot_treatments)
     }
     
-    if (nrow(df) == 0) {
+    df
+  })
+  
+  auc_preview <- reactive({
+    req(filtered_stats_long())
+    filtered_stats_long() %>%
+      group_by(receptor, treatment, passage) %>%
+      summarize(
+        auc = auc_trapz(elapsed, value_norm),
+        .groups = "drop"
+      )
+  })
+  
+  prism_wide <- reactive({
+    req(auc_preview())
+    auc_df <- auc_preview() %>%
+      arrange(receptor, treatment, passage)
+    
+    auc_df <- auc_df %>%
+      group_by(receptor, treatment) %>%
+      mutate(rep_idx = row_number()) %>%
+      ungroup()
+    
+    col_template <- auc_df %>%
+      count(treatment, name = "n_rep") %>%
+      group_by(treatment) %>%
+      summarise(max_rep = max(n_rep), .groups = "drop") %>%
+      mutate(col_keys = purrr::map2(treatment, max_rep, ~ paste0(.x, "__rep", seq_len(.y)))) %>%
+      pull(col_keys) %>%
+      unlist()
+    
+    wide <- auc_df %>%
+      mutate(col_key = paste0(treatment, "__rep", rep_idx)) %>%
+      select(receptor, col_key, auc) %>%
+      pivot_wider(names_from = col_key, values_from = auc)
+    
+    wide %>%
+      select(receptor, any_of(col_template))
+  })
+  
+  output$preview_prism <- renderTable({
+    req(prism_wide())
+    prism_wide()
+  }, striped = TRUE)
+  
+  output$plot <- renderPlot({
+    req(filtered_stats_long())
+    df <- filtered_stats_long()
+    
+    if (all(is.na(df$value_norm)) || nrow(df) == 0) {
       plot.new()
       text(0.5, 0.5, "No data remain after applying the current plot filters.")
       return()
@@ -796,11 +921,44 @@ server <- function(input, output, session) {
       theme_minimal()
   })
   
+  output$auc_plot <- renderPlot({
+    req(auc_preview())
+    df <- auc_preview()
+    
+    if (nrow(df) == 0 || all(!is.finite(df$auc))) {
+      plot.new()
+      text(0.5, 0.5, "No AUC values available for the current filters.")
+      return()
+    }
+    
+    dodge <- position_dodge(width = 0.6)
+    
+    ggplot(df, aes(x = treatment, y = auc, color = receptor)) +
+      geom_point(position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.6), alpha = 0.75, size = 2) +
+      stat_summary(aes(group = receptor), fun = mean, geom = "line", position = dodge, linewidth = 0.8) +
+      stat_summary(aes(group = receptor), fun = mean, geom = "point", position = dodge, size = 2.5) +
+      labs(
+        x = "Treatment",
+        y = "AUC",
+        title = "Combined AUC preview for current filter window"
+      ) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+  
   output$download_factor_map <- downloadHandler(
     filename = function() paste0("incucyte_factor_assignments_", Sys.Date(), ".csv"),
     content = function(file) {
       req(current_factor_map())
       write_csv(current_factor_map(), file)
+    }
+  )
+  
+  output$download_passage_map <- downloadHandler(
+    filename = function() paste0("incucyte_passage_assignments_", Sys.Date(), ".csv"),
+    content = function(file) {
+      req(current_passage_map())
+      write_csv(current_passage_map(), file)
     }
   )
   
@@ -813,10 +971,38 @@ server <- function(input, output, session) {
   )
   
   output$download_prism <- downloadHandler(
-    filename = function() paste0("incucyte_prism_wide_1row_per_time_", Sys.Date(), ".csv"),
+    filename = function() paste0("incucyte_prism_auc_", Sys.Date(), ".csv"),
     content = function(file) {
       req(prism_wide())
-      write_csv(prism_wide(), file)
+      
+      wide <- prism_wide()
+      value_cols <- names(wide)[-1]
+      
+      treatment_header <- c(
+        "",
+        stringr::str_replace(value_cols, "__rep\\d+$", "")
+      )
+      
+      rep_header <- c(
+        "receptor",
+        stringr::str_extract(value_cols, "rep\\d+$")
+      )
+      
+      out <- rbind(
+        treatment_header,
+        rep_header,
+        as.matrix(wide)
+      )
+      
+      write.table(
+        out,
+        file = file,
+        sep = ",",
+        row.names = FALSE,
+        col.names = FALSE,
+        quote = TRUE,
+        na = ""
+      )
     }
   )
 }
