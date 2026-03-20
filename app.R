@@ -15,6 +15,7 @@
 #     gr  -> GR
 #     mr  -> MR
 # - Factor editor includes n_reps = number of unique imported files contributing each condition
+# - Plot tab includes filters for elapsed-time range, receptor levels, and treatment levels
 # - Prism export with one row per elapsed time
 # - Plot defaults: facet by Passage; color by receptor
 
@@ -293,7 +294,16 @@ ui <- fluidPage(
     ),
     mainPanel(
       tabsetPanel(
-        tabPanel("Plot", plotOutput("plot", height = 460)),
+        tabPanel(
+          "Plot",
+          plotOutput("plot", height = 460),
+          br(),
+          fluidRow(
+            column(4, uiOutput("plot_time_ui")),
+            column(4, uiOutput("plot_receptor_ui")),
+            column(4, uiOutput("plot_treatment_ui"))
+          )
+        ),
         tabPanel(
           "Factor editor",
           br(),
@@ -462,10 +472,10 @@ server <- function(input, output, session) {
       distinct(condition, receptor, treatment, factor_key) %>%
       left_join(rep_counts, by = "condition") %>%
       mutate(
-        receptor = as.character(receptor),
-        treatment = as.character(treatment),
+        receptor   = as.character(receptor),
+        treatment  = as.character(treatment),
         factor_key = as.character(factor_key),
-        n_reps = as.integer(n_reps)
+        n_reps     = as.integer(n_reps)
       ) %>%
       arrange(condition)
   })
@@ -594,6 +604,7 @@ server <- function(input, output, session) {
     )
   })
   
+  # Match channels using parsed factors, not raw condition strings
   wide_joined_passage <- reactive({
     req(raw_long())
     raw_long() %>%
@@ -666,6 +677,57 @@ server <- function(input, output, session) {
       arrange(receptor, treatment, passage, elapsed)
   })
   
+  output$plot_time_ui <- renderUI({
+    req(stats_long())
+    df <- stats_long() %>% filter(is.finite(elapsed))
+    
+    if (nrow(df) == 0) return(NULL)
+    
+    rng <- range(df$elapsed, na.rm = TRUE)
+    step_val <- max((rng[2] - rng[1]) / 100, .Machine$double.eps)
+    
+    sliderInput(
+      "plot_time_range",
+      "Elapsed time range",
+      min = floor(rng[1]),
+      max = ceiling(rng[2]),
+      value = c(floor(rng[1]), ceiling(rng[2])),
+      step = step_val
+    )
+  })
+  
+  output$plot_receptor_ui <- renderUI({
+    req(stats_long())
+    levs <- stats_long() %>%
+      pull(receptor) %>%
+      as.character() %>%
+      unique() %>%
+      sort()
+    
+    checkboxGroupInput(
+      "plot_receptors",
+      "Receptors to show",
+      choices = levs,
+      selected = levs
+    )
+  })
+  
+  output$plot_treatment_ui <- renderUI({
+    req(stats_long())
+    levs <- stats_long() %>%
+      pull(treatment) %>%
+      as.character() %>%
+      unique() %>%
+      sort()
+    
+    checkboxGroupInput(
+      "plot_treatments",
+      "Treatments to show",
+      choices = levs,
+      selected = levs
+    )
+  })
+  
   prism_wide <- reactive({
     req(stats_long())
     df <- stats_long() %>%
@@ -696,6 +758,30 @@ server <- function(input, output, session) {
     if (all(is.na(df$value_norm))) {
       plot.new()
       text(0.5, 0.5, "No normalized values to plot yet.\nUpload files, assign channels, choose signal/control, click 'Import + Process'.")
+      return()
+    }
+    
+    if (!is.null(input$plot_time_range)) {
+      df <- df %>%
+        filter(
+          elapsed >= input$plot_time_range[1],
+          elapsed <= input$plot_time_range[2]
+        )
+    }
+    
+    if (!is.null(input$plot_receptors) && length(input$plot_receptors) > 0) {
+      df <- df %>%
+        filter(as.character(receptor) %in% input$plot_receptors)
+    }
+    
+    if (!is.null(input$plot_treatments) && length(input$plot_treatments) > 0) {
+      df <- df %>%
+        filter(as.character(treatment) %in% input$plot_treatments)
+    }
+    
+    if (nrow(df) == 0) {
+      plot.new()
+      text(0.5, 0.5, "No data remain after applying the current plot filters.")
       return()
     }
     
