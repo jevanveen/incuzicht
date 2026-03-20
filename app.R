@@ -16,8 +16,8 @@
 #     mr  -> MR
 # - Factor editor includes n_reps = number of unique imported files contributing each condition
 # - Plot tab includes filters for elapsed-time range, receptor levels, and treatment levels
-# - Prism export with one row per elapsed time
-# - Plot defaults: facet by Passage; color by receptor
+# - Prism export uses AUC values over the currently selected plot/filter window
+#   formatted as rows = receptor, columns grouped by treatment, one column per replicate
 
 library(shiny)
 library(tidyverse)
@@ -80,8 +80,8 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
   
   dat %>%
     mutate(
-      datetime = as.character(datetime),
-      elapsed  = suppressWarnings(as.numeric(elapsed))
+      datetime  = as.character(datetime),
+      elapsed   = suppressWarnings(as.numeric(elapsed))
     ) %>%
     pivot_longer(
       cols = -c(datetime, elapsed),
@@ -264,6 +264,20 @@ ols_control_adjust <- function(df, sig_col, ctl_col) {
   df
 }
 
+auc_trapz <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  x <- x[ok]
+  y <- y[ok]
+  
+  if (length(x) < 2) return(NA_real_)
+  
+  ord <- order(x)
+  x <- x[ord]
+  y <- y[ord]
+  
+  sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
 # ---------------------------
 # UI
 # ---------------------------
@@ -290,7 +304,7 @@ ui <- fluidPage(
       h4("Downloads"),
       downloadButton("download_factor_map", "Factor assignments (csv)"),
       downloadButton("download_norm", "Normalized by Passage (csv)"),
-      downloadButton("download_prism", "Prism wide export (csv)")
+      downloadButton("download_prism", "Prism AUC export (csv)")
     ),
     mainPanel(
       tabsetPanel(
@@ -514,8 +528,8 @@ server <- function(input, output, session) {
         tbl <- as_tibble(tbl) %>%
           mutate(
             condition = as.character(condition),
-            n_reps = suppressWarnings(as.integer(n_reps)),
-            receptor = as.character(receptor),
+            n_reps    = suppressWarnings(as.integer(n_reps)),
+            receptor  = as.character(receptor),
             treatment = as.character(treatment)
           )
         factor_map_rv(tbl)
@@ -730,25 +744,59 @@ server <- function(input, output, session) {
   
   prism_wide <- reactive({
     req(stats_long())
-    df <- stats_long() %>%
-      group_by(elapsed, receptor, treatment, passage) %>%
-      summarize(value = mean(value_norm, na.rm = TRUE), .groups = "drop") %>%
-      mutate(col_key = paste(receptor, treatment, passage, sep = "__"))
+    df <- stats_long()
     
-    wide <- df %>%
-      select(elapsed, col_key, value) %>%
-      pivot_wider(names_from = col_key, values_from = value)
+    if (!is.null(input$plot_time_range)) {
+      df <- df %>%
+        filter(
+          elapsed >= input$plot_time_range[1],
+          elapsed <= input$plot_time_range[2]
+        )
+    }
     
-    col_meta <- df %>%
-      distinct(col_key, receptor, treatment, passage) %>%
+    if (!is.null(input$plot_receptors) && length(input$plot_receptors) > 0) {
+      df <- df %>%
+        filter(as.character(receptor) %in% input$plot_receptors)
+    }
+    
+    if (!is.null(input$plot_treatments) && length(input$plot_treatments) > 0) {
+      df <- df %>%
+        filter(as.character(treatment) %in% input$plot_treatments)
+    }
+    
+    auc_df <- df %>%
+      group_by(receptor, treatment, passage) %>%
+      summarise(
+        auc = auc_trapz(elapsed, value_norm),
+        .groups = "drop"
+      ) %>%
       arrange(receptor, treatment, passage)
     
-    wide %>% select(elapsed, any_of(col_meta$col_key))
+    auc_df <- auc_df %>%
+      group_by(receptor, treatment) %>%
+      mutate(rep_idx = row_number()) %>%
+      ungroup()
+    
+    col_template <- auc_df %>%
+      count(treatment, name = "n_rep") %>%
+      group_by(treatment) %>%
+      summarise(max_rep = max(n_rep), .groups = "drop") %>%
+      mutate(col_keys = purrr::map2(treatment, max_rep, ~ paste0(.x, "__rep", seq_len(.y)))) %>%
+      pull(col_keys) %>%
+      unlist()
+    
+    wide <- auc_df %>%
+      mutate(col_key = paste0(treatment, "__rep", rep_idx)) %>%
+      select(receptor, col_key, auc) %>%
+      pivot_wider(names_from = col_key, values_from = auc)
+    
+    wide %>%
+      select(receptor, any_of(col_template))
   })
   
   output$preview_prism <- renderTable({
     req(prism_wide())
-    head(prism_wide(), 20)
+    prism_wide()
   }, striped = TRUE)
   
   output$plot <- renderPlot({
@@ -813,10 +861,38 @@ server <- function(input, output, session) {
   )
   
   output$download_prism <- downloadHandler(
-    filename = function() paste0("incucyte_prism_wide_1row_per_time_", Sys.Date(), ".csv"),
+    filename = function() paste0("incucyte_prism_auc_", Sys.Date(), ".csv"),
     content = function(file) {
       req(prism_wide())
-      write_csv(prism_wide(), file)
+      
+      wide <- prism_wide()
+      value_cols <- names(wide)[-1]
+      
+      treatment_header <- c(
+        "",
+        stringr::str_replace(value_cols, "__rep\\d+$", "")
+      )
+      
+      rep_header <- c(
+        "receptor",
+        stringr::str_extract(value_cols, "rep\\d+$")
+      )
+      
+      out <- rbind(
+        treatment_header,
+        rep_header,
+        as.matrix(wide)
+      )
+      
+      write.table(
+        out,
+        file = file,
+        sep = ",",
+        row.names = FALSE,
+        col.names = FALSE,
+        quote = TRUE,
+        na = ""
+      )
     }
   )
 }
