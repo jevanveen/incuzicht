@@ -975,25 +975,41 @@ server <- function(input, output, session) {
     
     df <- df %>%
       mutate(
-        treatment_color = case_when(
-          str_detect(treatment, "VEH") ~ "#000000",
-          str_detect(treatment, "E2") & str_detect(treatment, "P4") ~ "#0F80FF",
-          str_detect(treatment, "E2") ~ "#FB0280",
-          str_detect(treatment, "P4") ~ "#FD8008",
-          TRUE ~ "#666666"
+        treatment_group = case_when(
+          str_detect(treatment, "VEH") ~ "VEH",
+          str_detect(treatment, "E2") & str_detect(treatment, "P4") ~ "Combo",
+          str_detect(treatment, "E2") ~ "E2",
+          str_detect(treatment, "P4") ~ "P4",
+          TRUE ~ "Other"
+        ),
+        treatment_group = factor(
+          treatment_group,
+          levels = c("VEH", "E2", "P4", "Combo", "Other")
         )
       )
     
-    ggplot(df, aes(x = receptor, y = auc, color = treatment_color)) +
+    dodge <- position_dodge(width = 0.6)
+    
+    ggplot(df, aes(x = receptor, y = auc, color = treatment_group)) +
       geom_point(
-        position = position_jitter(width = 0.15, height = 0),
+        position = dodge,
         size = 2.5,
-        alpha = 0.8
+        alpha = 0.45
       ) +
-      scale_color_identity() +
+      scale_color_manual(
+        breaks = c("VEH", "E2", "P4", "Combo"),
+        values = c(
+          "VEH" = "#000000",
+          "E2" = "#FB0280",
+          "P4" = "#FD8008",
+          "Combo" = "#0F80FF",
+          "Other" = "#666666"
+        )
+      ) +
       labs(
         x = "Receptor",
         y = "AUC",
+        color = "Treatment",
         title = "Combined AUC preview for current filter window"
       ) +
       theme_classic() +
