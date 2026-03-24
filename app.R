@@ -152,45 +152,85 @@ extract_treatment <- function(x) {
   
   veh_only <- str_detect(s, "\\bveh\\b|\\bvehicle\\b|\\be2oh\\b|\\bethanol\\b|\\bdmso\\b")
   
-  hits <- character(0)
+  tokens <- str_split(s, "\\s+", simplify = TRUE)
+  tokens <- tokens[tokens != ""]
   
-  # compound-first only: E2 30 nm, P4 250 nm, DHT 30 nm
-  m1 <- str_match_all(
-    s,
-    regex("\\b(e2|p4|dht)\\b\\s*([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\b", ignore_case = TRUE)
-  )[[1]]
+  is_num <- function(z) str_detect(z, "^[0-9]+\\.?[0-9]*$")
+  is_unit <- function(z) str_detect(z, regex("^(pm|nm|um|µm|mm)$", ignore_case = TRUE))
+  is_ligand <- function(z) str_detect(z, regex("^(e2|p4|dht)$", ignore_case = TRUE))
   
-  if (nrow(m1) > 0) {
-    vals <- paste0(
-      m1[, 3],
-      toupper(ifelse(m1[, 4] == "µm", "uM", m1[, 4])),
-      " ",
-      toupper(m1[, 2])
-    )
-    hits <- c(hits, vals)
+  normalize_unit <- function(z) {
+    z <- toupper(z)
+    if (z == "µM") "uM" else z
   }
   
-  # amount-first only when ligand immediately follows concentration
-  m2 <- str_match_all(
-    s,
-    regex("\\b([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\s+(e2|p4|dht)\\b", ignore_case = TRUE)
-  )[[1]]
+  normalize_ligand <- function(z) toupper(z)
   
-  if (nrow(m2) > 0) {
-    vals <- paste0(
-      m2[, 2],
-      toupper(ifelse(m2[, 3] == "µm", "uM", m2[, 3])),
-      " ",
-      toupper(m2[, 4])
-    )
-    hits <- c(hits, vals)
+  hits <- character(0)
+  used <- rep(FALSE, length(tokens))
+  
+  i <- 1
+  while (i <= length(tokens)) {
+    
+    # skip already used tokens
+    if (used[i]) {
+      i <- i + 1
+      next
+    }
+    
+    # Pattern 1: ligand-first  E2 30 nm
+    if (i + 2 <= length(tokens)) {
+      if (!used[i] && !used[i + 1] && !used[i + 2] &&
+          is_ligand(tokens[i]) &&
+          is_num(tokens[i + 1]) &&
+          is_unit(tokens[i + 2])) {
+        
+        hits <- c(
+          hits,
+          paste0(
+            tokens[i + 1],
+            normalize_unit(tokens[i + 2]),
+            " ",
+            normalize_ligand(tokens[i])
+          )
+        )
+        
+        used[i:(i + 2)] <- TRUE
+        i <- i + 3
+        next
+      }
+    }
+    
+    # Pattern 2: amount-first  30 nm E2
+    if (i + 2 <= length(tokens)) {
+      if (!used[i] && !used[i + 1] && !used[i + 2] &&
+          is_num(tokens[i]) &&
+          is_unit(tokens[i + 1]) &&
+          is_ligand(tokens[i + 2])) {
+        
+        hits <- c(
+          hits,
+          paste0(
+            tokens[i],
+            normalize_unit(tokens[i + 1]),
+            " ",
+            normalize_ligand(tokens[i + 2])
+          )
+        )
+        
+        used[i:(i + 2)] <- TRUE
+        i <- i + 3
+        next
+      }
+    }
+    
+    i <- i + 1
   }
   
   hits <- unique(hits)
   
-  # optional: sort by ligand name for stable output
   if (length(hits) > 0) {
-    return(paste(sort(hits), collapse = " + "))
+    return(paste(hits, collapse = " + "))
   }
   
   if (veh_only) return("VEH")
