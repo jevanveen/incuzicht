@@ -1,34 +1,19 @@
 # app.R
 # Incucyte Multi-File Import + Channel Normalization
+# Supports two header schemas:
+#   1) Well-style headers with well IDs, e.g. "er pra E2 30 nm 0.5 ul (A1)"
+#   2) Comma-separated condition headers, e.g. "E2 30 nM,HEK293T + ERa (1) 50K / well"
+#
+# Features
 # - Auto-parses receptor + treatment from condition headers
-# - Extracts well IDs like A3 from headers and shows them in the editor
+# - Extracts well IDs where present
+# - Extracts explicit replicate IDs where present in comma-style headers
 # - Matching across files/channels is based on parsed factors, not raw condition strings
 # - Factor editor uses rhandsontable in LONG format with sortable columns
-# - Passage is editable in the same factor editor table, so mixed-passage plates are supported
-# - Receptor canonical names after parsing:
-#     era/er -> ER_a
-#     erb    -> ER_b
-#     pgr/pr -> PR
-#     pra    -> PR_a
-#     prb    -> PR_b
-#     ar     -> AR
-#     gr     -> GR
-#     mr     -> MR
-# - Receptor combinations are canonicalized, so equivalent combos always sort identically
-# - Treatment combinations are canonicalized, so equivalent combos always sort identically
-# - Factor editor includes:
-#     * file
-#     * well_id
-#     * condition
-#     * n_reps
-#     * passage
-#     * receptor
-#     * treatment
-# - Plot tab includes:
-#     * filtered timecourse plot
-#     * combined preview AUC plot for the current filter window
+# - Passage is editable in the same factor editor table
+# - Receptor and treatment combinations are canonicalized
+# - Plot tab includes timecourse + AUC preview
 # - Prism export uses AUC values over the currently selected plot/filter window
-#   formatted as rows = receptor, columns grouped by treatment, one column per replicate
 
 library(shiny)
 library(tidyverse)
@@ -36,11 +21,11 @@ library(readr)
 library(stringr)
 library(rhandsontable)
 
-# ---------------------------
-# Helpers
-# ---------------------------
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
+# ---------------------------
+# Low-level file helpers
+# ---------------------------
 find_data_header_row <- function(lines) {
   idx <- which(str_detect(lines, "^Date Time\\tElapsed\\b"))
   if (length(idx) == 0) return(NA_integer_)
@@ -77,11 +62,10 @@ read_incucyte_header_meta <- function(path) {
   )
 }
 
-read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
+read_incucyte_raw_table <- function(path) {
   lines <- readLines(path, warn = FALSE)
   header_i <- find_data_header_row(lines)
   if (is.na(header_i)) stop("Couldn't find header row starting with 'Date Time<TAB>Elapsed'.")
-  
   txt <- paste(lines[header_i:length(lines)], collapse = "\n")
   
   dat <- read_delim(
@@ -93,40 +77,12 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
   
   if (ncol(dat) < 3) stop("Parsed <3 columns. Is this the right Incucyte export format?")
   names(dat)[1:2] <- c("datetime", "elapsed")
-  
-  if (drop_stderr) dat <- dat %>% select(-matches("\\(Std Err"))
-  
-  dat %>%
-    mutate(
-      datetime = as.character(datetime),
-      elapsed  = suppressWarnings(as.numeric(elapsed))
-    ) %>%
-    pivot_longer(
-      cols = -c(datetime, elapsed),
-      names_to = "condition",
-      values_to = "value"
-    ) %>%
-    mutate(
-      condition = as.character(condition),
-      value     = suppressWarnings(as.numeric(value)),
-      well_id   = extract_well_id(condition)
-    )
+  dat
 }
 
 # ---------------------------
-# Header cleaning / parsing
+# Canonicalization helpers
 # ---------------------------
-clean_condition_header <- function(x) {
-  x %>%
-    str_to_lower() %>%
-    str_replace_all("\\([a-h][0-9]{1,2}\\)", " ") %>%           # remove well IDs like (A1)
-    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ul\\b", " ") %>%    # remove dispense volumes
-    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*mg/ml\\b", " ") %>% # remove stock concentration notes
-    str_replace_all("_", " ") %>%
-    str_replace_all("\\s+", " ") %>%
-    str_trim()
-}
-
 canonicalize_receptor_combo <- function(x) {
   if (is.na(x) || x == "" || tolower(x) == "none") return("none")
   
@@ -160,7 +116,6 @@ canonicalize_receptor_combo <- function(x) {
   parts <- purrr::map_chr(parts, canon_part)
   parts <- unique(parts[parts != "none" & parts != ""])
   
-  # if subtype present, drop generic PR
   if (any(c("PR_a", "PR_b") %in% parts)) parts <- setdiff(parts, "PR")
   
   ord <- c("ER_a", "ER_b", "PR", "PR_a", "PR_b", "AR", "GR", "MR")
@@ -179,7 +134,7 @@ canonicalize_treatment_combo <- function(x) {
   parts <- unique(parts)
   
   get_ligand <- function(s) {
-    m <- str_match(s, "\\b(E2|P4|DHT)\\b")
+    m <- str_match(s, "\\b(E2|P4|DHT|4-OHT|DEX|CORT)\\b")
     lig <- m[, 2]
     ifelse(is.na(lig), "ZZZ", lig)
   }
@@ -190,7 +145,7 @@ canonicalize_treatment_combo <- function(x) {
     ifelse(is.na(dose), Inf, dose)
   }
   
-  ligand_order <- c("E2", "P4", "DHT", "ZZZ")
+  ligand_order <- c("E2", "P4", "DHT", "4-OHT", "DEX", "CORT", "ZZZ")
   ord_lig <- match(get_ligand(parts), ligand_order)
   ord_dose <- get_dose(parts)
   
@@ -198,107 +153,7 @@ canonicalize_treatment_combo <- function(x) {
   paste(parts, collapse = " + ")
 }
 
-extract_receptors <- function(x) {
-  s <- clean_condition_header(x)
-  recs <- c()
-  
-  if (str_detect(s, "\\berb\\b|\\ber b\\b|\\besr2\\b|\\ber2\\b")) recs <- c(recs, "ER_b")
-  if (str_detect(s, "\\ber\\b|\\bera\\b|\\ber a\\b|\\besr1\\b|\\ber1\\b")) recs <- c(recs, "ER_a")
-  if (str_detect(s, "\\bpra\\b|\\bpr a\\b")) recs <- c(recs, "PR_a")
-  if (str_detect(s, "\\bprb\\b|\\bpr b\\b")) recs <- c(recs, "PR_b")
-  if (str_detect(s, "\\bpgr\\b|\\bpr\\b")) recs <- c(recs, "PR")
-  if (str_detect(s, "\\bar\\b|\\bandrogen receptor\\b|\\bnr3c4\\b")) recs <- c(recs, "AR")
-  if (str_detect(s, "\\bgr\\b|\\bglucocorticoid receptor\\b|\\bnr3c1\\b")) recs <- c(recs, "GR")
-  if (str_detect(s, "\\bmr\\b|\\bmineralocorticoid receptor\\b|\\bnr3c2\\b")) recs <- c(recs, "MR")
-  
-  canonicalize_receptor_combo(paste(unique(recs), collapse = " + "))
-}
-
-extract_treatment <- function(x) {
-  s <- clean_condition_header(x)
-  veh_only <- str_detect(s, "\\bveh\\b|\\bvehicle\\b|\\be2oh\\b|\\bethanol\\b|\\bdmso\\b")
-  
-  tokens <- str_split(s, "\\s+", simplify = TRUE)
-  tokens <- tokens[tokens != ""]
-  
-  is_num <- function(z) str_detect(z, "^[0-9]+\\.?[0-9]*$")
-  is_unit <- function(z) str_detect(z, regex("^(pm|nm|um|µm|mm)$", ignore_case = TRUE))
-  is_ligand <- function(z) str_detect(z, regex("^(e2|p4|dht)$", ignore_case = TRUE))
-  
-  normalize_unit <- function(z) {
-    z <- toupper(z)
-    if (z == "µM") "uM" else z
-  }
-  
-  normalize_ligand <- function(z) toupper(z)
-  
-  hits <- character(0)
-  used <- rep(FALSE, length(tokens))
-  
-  i <- 1
-  while (i <= length(tokens)) {
-    if (used[i]) {
-      i <- i + 1
-      next
-    }
-    
-    # ligand-first: E2 30 nm
-    if (i + 2 <= length(tokens)) {
-      if (!used[i] && !used[i + 1] && !used[i + 2] &&
-          is_ligand(tokens[i]) &&
-          is_num(tokens[i + 1]) &&
-          is_unit(tokens[i + 2])) {
-        
-        hits <- c(
-          hits,
-          paste0(
-            tokens[i + 1],
-            normalize_unit(tokens[i + 2]),
-            " ",
-            normalize_ligand(tokens[i])
-          )
-        )
-        used[i:(i + 2)] <- TRUE
-        i <- i + 3
-        next
-      }
-    }
-    
-    # amount-first: 30 nm E2
-    if (i + 2 <= length(tokens)) {
-      if (!used[i] && !used[i + 1] && !used[i + 2] &&
-          is_num(tokens[i]) &&
-          is_unit(tokens[i + 1]) &&
-          is_ligand(tokens[i + 2])) {
-        
-        hits <- c(
-          hits,
-          paste0(
-            tokens[i],
-            normalize_unit(tokens[i + 1]),
-            " ",
-            normalize_ligand(tokens[i + 2])
-          )
-        )
-        used[i:(i + 2)] <- TRUE
-        i <- i + 3
-        next
-      }
-    }
-    
-    i <- i + 1
-  }
-  
-  hits <- unique(hits)
-  
-  if (length(hits) > 0) return(canonicalize_treatment_combo(paste(hits, collapse = " + ")))
-  if (veh_only) return("VEH")
-  "VEH"
-}
-
-canonicalize_receptor_edit <- function(x) {
-  canonicalize_receptor_combo(x)
-}
+canonicalize_receptor_edit <- function(x) canonicalize_receptor_combo(x)
 
 canonicalize_treatment_edit <- function(x) {
   z <- str_trim(as.character(x))
@@ -323,13 +178,209 @@ make_factor_key <- function(receptor, treatment) {
   paste(normalize_factor_key(receptor), normalize_factor_key(treatment), sep = " || ")
 }
 
+# ---------------------------
+# Parser helpers
+# ---------------------------
+clean_condition_header <- function(x) {
+  x %>%
+    str_to_lower() %>%
+    str_replace_all("\\([a-h][0-9]{1,2}\\)", " ") %>%
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ul\\b", " ") %>%
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*mg/ml\\b", " ") %>%
+    str_replace_all("_", " ") %>%
+    str_replace_all("\\s+", " ") %>%
+    str_trim()
+}
+
+extract_receptors <- function(x) {
+  s <- clean_condition_header(x)
+  recs <- c()
+  
+  if (str_detect(s, "\\berb\\b|\\ber b\\b|\\besr2\\b|\\ber2\\b")) recs <- c(recs, "ER_b")
+  if (str_detect(s, "\\ber\\b|\\bera\\b|\\ber a\\b|\\besr1\\b|\\ber1\\b|\\bnoer\\b")) {
+    if (str_detect(s, "\\bnoer\\b")) {
+      # preserve raw token for manual editing if desired
+      recs <- c(recs, "NOER")
+    } else {
+      recs <- c(recs, "ER_a")
+    }
+  }
+  if (str_detect(s, "\\bpra\\b|\\bpr a\\b")) recs <- c(recs, "PR_a")
+  if (str_detect(s, "\\bprb\\b|\\bpr b\\b")) recs <- c(recs, "PR_b")
+  if (str_detect(s, "\\bpgr\\b|\\bpr\\b")) recs <- c(recs, "PR")
+  if (str_detect(s, "\\bar\\b|\\bandrogen receptor\\b|\\bnr3c4\\b")) recs <- c(recs, "AR")
+  if (str_detect(s, "\\bgr\\b|\\bglucocorticoid receptor\\b|\\bnr3c1\\b")) recs <- c(recs, "GR")
+  if (str_detect(s, "\\bmr\\b|\\bmineralocorticoid receptor\\b|\\bnr3c2\\b")) recs <- c(recs, "MR")
+  
+  if (length(recs) == 0) return("none")
+  
+  # allow noncanonical custom receptor like NOER to survive
+  canonical <- recs[recs %in% c("ER_a","ER_b","PR","PR_a","PR_b","AR","GR","MR")]
+  custom <- setdiff(unique(recs), canonical)
+  
+  canonical <- canonicalize_receptor_combo(paste(canonical, collapse = " + "))
+  canon_parts <- if (canonical == "none") character(0) else str_split(canonical, "\\s*\\+\\s*", simplify = FALSE)[[1]]
+  
+  final_parts <- c(canon_parts, custom)
+  final_parts <- unique(final_parts)
+  
+  if (length(final_parts) == 0) "none" else paste(final_parts, collapse = " + ")
+}
+
+extract_treatment <- function(x) {
+  s <- clean_condition_header(x)
+  veh_only <- str_detect(s, "\\bveh\\b|\\bvehicle\\b|\\be2oh\\b|\\bethanol\\b|\\bdmso\\b")
+  
+  tokens <- str_split(s, "\\s+", simplify = TRUE)
+  tokens <- tokens[tokens != ""]
+  
+  is_num <- function(z) str_detect(z, "^[0-9]+\\.?[0-9]*$")
+  is_unit <- function(z) str_detect(z, regex("^(pm|nm|um|µm|mm)$", ignore_case = TRUE))
+  is_ligand <- function(z) str_detect(z, regex("^(e2|p4|dht|4-oht|dex|cort)$", ignore_case = TRUE))
+  
+  normalize_unit <- function(z) {
+    z <- toupper(z)
+    if (z == "µM") "uM" else z
+  }
+  
+  normalize_ligand <- function(z) toupper(z)
+  
+  hits <- character(0)
+  used <- rep(FALSE, length(tokens))
+  
+  i <- 1
+  while (i <= length(tokens)) {
+    if (used[i]) {
+      i <- i + 1
+      next
+    }
+    
+    if (i + 2 <= length(tokens)) {
+      if (!used[i] && !used[i + 1] && !used[i + 2] &&
+          is_ligand(tokens[i]) &&
+          is_num(tokens[i + 1]) &&
+          is_unit(tokens[i + 2])) {
+        hits <- c(hits, paste0(tokens[i + 1], normalize_unit(tokens[i + 2]), " ", normalize_ligand(tokens[i])))
+        used[i:(i + 2)] <- TRUE
+        i <- i + 3
+        next
+      }
+    }
+    
+    if (i + 2 <= length(tokens)) {
+      if (!used[i] && !used[i + 1] && !used[i + 2] &&
+          is_num(tokens[i]) &&
+          is_unit(tokens[i + 1]) &&
+          is_ligand(tokens[i + 2])) {
+        hits <- c(hits, paste0(tokens[i], normalize_unit(tokens[i + 1]), " ", normalize_ligand(tokens[i + 2])))
+        used[i:(i + 2)] <- TRUE
+        i <- i + 3
+        next
+      }
+    }
+    
+    i <- i + 1
+  }
+  
+  hits <- unique(hits)
+  
+  if (length(hits) > 0) return(canonicalize_treatment_combo(paste(hits, collapse = " + ")))
+  if (veh_only) return("VEH")
+  "VEH"
+}
+
+# comma-style parser
+parse_comma_header <- function(header) {
+  if (str_detect(header, "Std Err")) {
+    return(tibble(
+      condition = header,
+      well_id = "",
+      receptor = NA_character_,
+      treatment = NA_character_,
+      replicate_id = NA_character_,
+      drop_me = TRUE
+    ))
+  }
+  
+  parts <- str_split(header, ",")[[1]]
+  treatment_part <- if (length(parts) >= 1) parts[1] else header
+  rhs <- if (length(parts) >= 2) paste(parts[-1], collapse = ",") else ""
+  
+  rep_id <- str_match(rhs, "\\((\\d+)\\)")[, 2]
+  receptor_token <- str_match(rhs, "\\+\\s*([A-Za-z0-9_]+)\\s*\\(")[, 2]
+  
+  receptor <- ifelse(
+    is.na(receptor_token),
+    extract_receptors(rhs),
+    canonicalize_receptor_edit(receptor_token)
+  )
+  
+  tibble(
+    condition = header,
+    well_id = "",
+    receptor = receptor,
+    treatment = extract_treatment(treatment_part),
+    replicate_id = ifelse(is.na(rep_id), "", rep_id),
+    drop_me = FALSE
+  )
+}
+
+# decide schema and return long table with parsed columns
+read_incucyte_long <- function(path, drop_stderr = TRUE) {
+  dat <- read_incucyte_raw_table(path)
+  
+  if (drop_stderr) {
+    dat <- dat %>% select(-matches("Std Err"))
+  }
+  
+  cond_names <- names(dat)[-(1:2)]
+  is_comma_schema <- any(str_detect(cond_names, ","))
+  
+  long <- dat %>%
+    pivot_longer(
+      cols = -c(datetime, elapsed),
+      names_to = "condition",
+      values_to = "value"
+    ) %>%
+    mutate(
+      condition = as.character(condition),
+      value = suppressWarnings(as.numeric(value)),
+      elapsed = suppressWarnings(as.numeric(elapsed)),
+      datetime = as.character(datetime)
+    )
+  
+  if (is_comma_schema) {
+    parsed <- purrr::map_dfr(unique(long$condition), parse_comma_header)
+    
+    long %>%
+      left_join(parsed, by = "condition") %>%
+      filter(!drop_me) %>%
+      mutate(
+        well_id = "",
+        receptor = if_else(is.na(receptor), "none", receptor),
+        treatment = if_else(is.na(treatment), "VEH", treatment)
+      ) %>%
+      select(datetime, elapsed, condition, well_id, replicate_id, receptor, treatment, value)
+  } else {
+    parsed <- guess_receptor_treatment(unique(long$condition))
+    
+    long %>%
+      left_join(parsed, by = c("condition" = "condition_raw")) %>%
+      mutate(
+        well_id = extract_well_id(condition),
+        replicate_id = "",
+        receptor = if_else(is.na(as.character(receptor)), "none", as.character(receptor)),
+        treatment = if_else(is.na(as.character(treatment)), "VEH", as.character(treatment))
+      ) %>%
+      select(datetime, elapsed, condition, well_id, replicate_id, receptor, treatment, value)
+  }
+}
+
 guess_receptor_treatment <- function(condition_vec) {
   tibble(condition_raw = condition_vec) %>%
     mutate(
       receptor = purrr::map_chr(condition_raw, extract_receptors),
-      treatment = purrr::map_chr(condition_raw, extract_treatment),
-      receptor = factor(receptor),
-      treatment = factor(treatment)
+      treatment = purrr::map_chr(condition_raw, extract_treatment)
     )
 }
 
@@ -363,13 +414,10 @@ auc_trapz <- function(x, y) {
   ok <- is.finite(x) & is.finite(y)
   x <- x[ok]
   y <- y[ok]
-  
   if (length(x) < 2) return(NA_real_)
-  
   ord <- order(x)
   x <- x[ord]
   y <- y[ord]
-  
   sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
 }
 
@@ -469,25 +517,21 @@ server <- function(input, output, session) {
   
   channel_map <- reactive({
     req(input$files)
-    fns <- input$files$name
-    
-    get_chan <- function(i, fname) {
-      id <- paste0("chan_", i)
-      val <- input[[id]]
-      if (is.null(val) || length(val) == 0 || is.na(val) || val == "") {
-        if (str_detect(tolower(fname), "red")) return("NIR")
-        if (str_detect(tolower(fname), "nir")) return("NIR")
-        if (str_detect(tolower(fname), "gfp|green")) return("GFP")
-        if (str_detect(tolower(fname), "orange")) return("Orange")
-        return("Other")
-      }
-      val
-    }
-    
     tibble(
       file = input$files$name,
       path = input$files$datapath,
-      channel = purrr::map_chr(seq_along(input$files$name), ~ get_chan(.x, input$files$name[.x]))
+      channel = purrr::map_chr(seq_along(input$files$name), function(i) {
+        fname <- input$files$name[i]
+        val <- input[[paste0("chan_", i)]]
+        if (is.null(val) || is.na(val) || val == "") {
+          if (str_detect(tolower(fname), "red")) return("NIR")
+          if (str_detect(tolower(fname), "nir")) return("NIR")
+          if (str_detect(tolower(fname), "gfp|green")) return("GFP")
+          if (str_detect(tolower(fname), "orange")) return("Orange")
+          return("Other")
+        }
+        val
+      })
     )
   })
   
@@ -510,7 +554,7 @@ server <- function(input, output, session) {
       selectInput("signal_channel", "Signal channel", choices = chans, selected = chans[1]),
       selectInput(
         "control_channel",
-        "Control channel (e.g., NIR for transfection efficiency)",
+        "Control channel",
         choices = chans,
         selected = if ("NIR" %in% chans) "NIR" else chans[min(2, length(chans))]
       ),
@@ -527,52 +571,49 @@ server <- function(input, output, session) {
       ),
       checkboxInput(
         "baseline_norm",
-        "Also baseline-normalize within Passage+Factor combination (divide by first non-NA timepoint)",
+        "Also baseline-normalize within Passage+Factor combination",
         value = FALSE
       )
     )
   })
   
-  # ---------------------------
-  # Imported data with auto-guessed factors
-  # ---------------------------
   raw_long_auto <- eventReactive(input$run, {
     cm <- channel_map()
     
-    dat <- purrr::pmap_dfr(cm, function(file, path, channel) {
+    purrr::pmap_dfr(cm, function(file, path, channel) {
       meta <- read_incucyte_header_meta(path)
-      dat0 <- read_incucyte_wide_conditions(path, drop_stderr = isTRUE(input$drop_stderr))
+      dat0 <- read_incucyte_long(path, drop_stderr = isTRUE(input$drop_stderr))
       
-      passage_chr <- meta$passage[[1]]
-      passage_lab <- if (!is.na(passage_chr) && passage_chr != "") paste0("Passage_", passage_chr) else "Passage_NA"
+      default_passage <- if (!is.na(meta$passage[[1]]) && meta$passage[[1]] != "") {
+        paste0("Passage_", meta$passage[[1]])
+      } else {
+        "Passage_NA"
+      }
       
+      # If explicit replicate ids exist, use them to create distinct default passage labels
+      # while preserving the file-level default passage stem.
       dat0 %>%
         mutate(
           file = file,
           channel = channel,
-          passage = passage_lab,
+          passage = if_else(
+            replicate_id != "",
+            paste0(default_passage, "_rep", replicate_id),
+            default_passage
+          ),
           vessel_name = meta$vessel_name[[1]] %||% NA_character_,
           metric      = meta$metric[[1]] %||% NA_character_,
           cell_type   = meta$cell_type[[1]] %||% NA_character_,
           analysis    = meta$analysis[[1]] %||% NA_character_,
-          condition_id = paste(file, condition, sep = " || ")
-        )
-    }) %>%
-      select(condition_id, file, well_id, channel, passage, vessel_name, metric, cell_type, analysis,
-             datetime, elapsed, condition, value)
-    
-    annot <- guess_receptor_treatment(unique(dat$condition))
-    
-    dat %>%
-      left_join(annot, by = c("condition" = "condition_raw")) %>%
-      mutate(
-        receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
-        treatment = forcats::fct_explicit_na(treatment, na_level = "VEH"),
-        receptor = factor(purrr::map_chr(as.character(receptor), canonicalize_receptor_combo)),
-        treatment = factor(purrr::map_chr(as.character(treatment), canonicalize_treatment_combo)),
-        factor_key = make_factor_key(receptor, treatment)
-      ) %>%
-      relocate(receptor, treatment, factor_key, .after = condition)
+          condition_id = paste(file, condition, sep = " || "),
+          receptor = canonicalize_receptor_combo(receptor),
+          treatment = canonicalize_treatment_combo(treatment),
+          factor_key = make_factor_key(receptor, treatment)
+        ) %>%
+        select(condition_id, file, well_id, replicate_id, channel, passage,
+               vessel_name, metric, cell_type, analysis,
+               datetime, elapsed, condition, receptor, treatment, factor_key, value)
+    })
   }, ignoreInit = TRUE)
   
   editor_default <- reactive({
@@ -583,17 +624,18 @@ server <- function(input, output, session) {
       count(condition, name = "n_reps")
     
     raw_long_auto() %>%
-      distinct(condition_id, file, well_id, condition, passage, receptor, treatment, factor_key) %>%
+      distinct(condition_id, file, well_id, replicate_id, condition, passage, receptor, treatment, factor_key) %>%
       left_join(rep_counts, by = "condition") %>%
       mutate(
-        well_id    = as.character(well_id),
-        passage    = as.character(passage),
-        receptor   = as.character(receptor),
-        treatment  = as.character(treatment),
+        well_id = as.character(well_id),
+        replicate_id = as.character(replicate_id),
+        passage = as.character(passage),
+        receptor = as.character(receptor),
+        treatment = as.character(treatment),
         factor_key = as.character(factor_key),
-        n_reps     = as.integer(n_reps)
+        n_reps = as.integer(n_reps)
       ) %>%
-      arrange(file, well_id, condition)
+      arrange(file, well_id, replicate_id, condition)
   })
   
   editor_rv <- reactiveVal(NULL)
@@ -610,24 +652,15 @@ server <- function(input, output, session) {
   output$editor_table <- renderRHandsontable({
     req(editor_rv())
     df <- editor_rv() %>%
-      select(file, well_id, condition, n_reps, passage, receptor, treatment)
+      select(file, well_id, replicate_id, condition, n_reps, passage, receptor, treatment)
     
-    rhandsontable(
-      df,
-      rowHeaders = NULL,
-      stretchH = "all",
-      height = 540
-    ) %>%
+    rhandsontable(df, rowHeaders = NULL, stretchH = "all", height = 540) %>%
       hot_col("file", readOnly = TRUE) %>%
       hot_col("well_id", readOnly = TRUE) %>%
+      hot_col("replicate_id", readOnly = TRUE) %>%
       hot_col("condition", readOnly = TRUE) %>%
       hot_col("n_reps", readOnly = TRUE) %>%
-      hot_table(
-        highlightCol = TRUE,
-        highlightRow = TRUE,
-        columnSorting = TRUE,
-        manualColumnMove = TRUE
-      )
+      hot_table(highlightCol = TRUE, highlightRow = TRUE, columnSorting = TRUE, manualColumnMove = TRUE)
   })
   
   observe({
@@ -638,6 +671,7 @@ server <- function(input, output, session) {
           mutate(
             file = as.character(file),
             well_id = as.character(well_id),
+            replicate_id = as.character(replicate_id),
             condition = as.character(condition),
             n_reps = suppressWarnings(as.integer(n_reps)),
             passage = as.character(passage),
@@ -646,11 +680,11 @@ server <- function(input, output, session) {
           )
         
         key_map <- editor_rv() %>%
-          transmute(condition_id, file, well_id, condition) %>%
+          transmute(condition_id, file, well_id, replicate_id, condition) %>%
           distinct()
         
         updated <- tbl %>%
-          left_join(key_map, by = c("file", "well_id", "condition")) %>%
+          left_join(key_map, by = c("file", "well_id", "replicate_id", "condition")) %>%
           select(condition_id, everything())
         
         editor_rv(updated)
@@ -666,6 +700,7 @@ server <- function(input, output, session) {
     df_edit <- editor_rv() %>%
       mutate(
         well_id = as.character(well_id),
+        replicate_id = as.character(replicate_id),
         passage = purrr::map_chr(passage, canonicalize_passage_edit),
         receptor = purrr::map_chr(receptor, canonicalize_receptor_edit),
         treatment = purrr::map_chr(treatment, canonicalize_treatment_edit),
@@ -674,7 +709,7 @@ server <- function(input, output, session) {
         treatment = factor(treatment),
         passage = factor(passage)
       ) %>%
-      arrange(file, well_id, condition)
+      arrange(file, well_id, replicate_id, condition)
     
     edited_map(df_edit)
   }, ignoreInit = TRUE)
@@ -687,6 +722,7 @@ server <- function(input, output, session) {
       editor_default() %>%
         mutate(
           well_id = as.character(well_id),
+          replicate_id = as.character(replicate_id),
           passage = factor(purrr::map_chr(passage, canonicalize_passage_edit)),
           receptor = factor(purrr::map_chr(receptor, canonicalize_receptor_edit)),
           treatment = factor(purrr::map_chr(treatment, canonicalize_treatment_edit)),
@@ -701,54 +737,45 @@ server <- function(input, output, session) {
     raw_long_auto() %>%
       select(-passage, -receptor, -treatment, -factor_key) %>%
       left_join(
-        current_editor_map() %>%
-          select(condition_id, passage, receptor, treatment, factor_key),
+        current_editor_map() %>% select(condition_id, passage, receptor, treatment, factor_key),
         by = "condition_id"
       ) %>%
       mutate(
         passage = factor(as.character(passage)),
-        receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
-        treatment = forcats::fct_explicit_na(treatment, na_level = "VEH"),
         receptor = factor(purrr::map_chr(as.character(receptor), canonicalize_receptor_combo)),
         treatment = factor(purrr::map_chr(as.character(treatment), canonicalize_treatment_combo)),
         factor_key = make_factor_key(receptor, treatment)
       ) %>%
-      relocate(well_id, passage, receptor, treatment, factor_key, .after = condition)
+      relocate(well_id, replicate_id, passage, receptor, treatment, factor_key, .after = condition)
   })
   
   output$join_checks <- renderPrint({
     req(raw_long())
     rl <- raw_long()
     
-    files_loaded <- rl %>%
-      distinct(file, channel, passage, vessel_name, metric, cell_type, analysis) %>%
-      arrange(passage, channel, file)
-    
-    per_channel <- rl %>%
-      group_by(channel) %>%
-      summarize(
-        n_rows = n(),
-        n_passages = n_distinct(passage),
-        n_factor_keys = n_distinct(factor_key),
-        n_times = n_distinct(elapsed),
-        .groups = "drop"
-      )
-    
-    factor_summary <- rl %>%
-      distinct(condition_id, condition, well_id, passage, receptor, treatment, factor_key) %>%
-      summarize(
-        n_rows = n(),
-        n_unique_factor_keys = n_distinct(factor_key),
-        receptor_levels = paste(sort(unique(as.character(receptor))), collapse = ", "),
-        treatment_levels = paste(sort(unique(as.character(treatment))), collapse = ", "),
-        passage_levels = paste(sort(unique(as.character(passage))), collapse = ", ")
-      )
-    
     list(
-      files_loaded = files_loaded,
-      per_channel_summary = per_channel,
-      factor_assignment_summary = factor_summary,
-      note = "Files/channels are matched by parsed factor combination (receptor + treatment). Passage is editable per imported condition row, mixed-passage plates are supported, and well IDs are extracted from headers when present."
+      files_loaded = rl %>%
+        distinct(file, channel, passage, vessel_name, metric, cell_type, analysis) %>%
+        arrange(passage, channel, file),
+      per_channel_summary = rl %>%
+        group_by(channel) %>%
+        summarize(
+          n_rows = n(),
+          n_passages = n_distinct(passage),
+          n_factor_keys = n_distinct(factor_key),
+          n_times = n_distinct(elapsed),
+          .groups = "drop"
+        ),
+      factor_assignment_summary = rl %>%
+        distinct(condition_id, condition, well_id, replicate_id, passage, receptor, treatment, factor_key) %>%
+        summarize(
+          n_rows = n(),
+          n_unique_factor_keys = n_distinct(factor_key),
+          receptor_levels = paste(sort(unique(as.character(receptor))), collapse = ", "),
+          treatment_levels = paste(sort(unique(as.character(treatment))), collapse = ", "),
+          passage_levels = paste(sort(unique(as.character(passage))), collapse = ", ")
+        ),
+      note = "Supports both well-style and comma-separated Incucyte header schemas. In comma-style files, replicate IDs like '(1)' are extracted and used in the default passage labels."
     )
   })
   
@@ -816,10 +843,6 @@ server <- function(input, output, session) {
   stats_long <- reactive({
     req(normalized_passage())
     normalized_passage() %>%
-      mutate(
-        receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
-        treatment = forcats::fct_explicit_na(treatment, na_level = "VEH")
-      ) %>%
       select(passage, elapsed, receptor, treatment, factor_key, value_norm) %>%
       arrange(receptor, treatment, passage, elapsed)
   })
@@ -827,7 +850,6 @@ server <- function(input, output, session) {
   output$plot_time_ui <- renderUI({
     req(stats_long())
     df <- stats_long() %>% filter(is.finite(elapsed))
-    
     if (nrow(df) == 0) return(NULL)
     
     rng <- range(df$elapsed, na.rm = TRUE)
@@ -845,34 +867,14 @@ server <- function(input, output, session) {
   
   output$plot_receptor_ui <- renderUI({
     req(stats_long())
-    levs <- stats_long() %>%
-      pull(receptor) %>%
-      as.character() %>%
-      unique() %>%
-      sort()
-    
-    checkboxGroupInput(
-      "plot_receptors",
-      "Receptors to show",
-      choices = levs,
-      selected = levs
-    )
+    levs <- stats_long() %>% pull(receptor) %>% as.character() %>% unique() %>% sort()
+    checkboxGroupInput("plot_receptors", "Receptors to show", choices = levs, selected = levs)
   })
   
   output$plot_treatment_ui <- renderUI({
     req(stats_long())
-    levs <- stats_long() %>%
-      pull(treatment) %>%
-      as.character() %>%
-      unique() %>%
-      sort()
-    
-    checkboxGroupInput(
-      "plot_treatments",
-      "Treatments to show",
-      choices = levs,
-      selected = levs
-    )
+    levs <- stats_long() %>% pull(treatment) %>% as.character() %>% unique() %>% sort()
+    checkboxGroupInput("plot_treatments", "Treatments to show", choices = levs, selected = levs)
   })
   
   filtered_stats_long <- reactive({
@@ -881,20 +883,13 @@ server <- function(input, output, session) {
     
     if (!is.null(input$plot_time_range)) {
       df <- df %>%
-        filter(
-          elapsed >= input$plot_time_range[1],
-          elapsed <= input$plot_time_range[2]
-        )
+        filter(elapsed >= input$plot_time_range[1], elapsed <= input$plot_time_range[2])
     }
-    
     if (!is.null(input$plot_receptors) && length(input$plot_receptors) > 0) {
-      df <- df %>%
-        filter(as.character(receptor) %in% input$plot_receptors)
+      df <- df %>% filter(as.character(receptor) %in% input$plot_receptors)
     }
-    
     if (!is.null(input$plot_treatments) && length(input$plot_treatments) > 0) {
-      df <- df %>%
-        filter(as.character(treatment) %in% input$plot_treatments)
+      df <- df %>% filter(as.character(treatment) %in% input$plot_treatments)
     }
     
     df
@@ -904,16 +899,12 @@ server <- function(input, output, session) {
     req(filtered_stats_long())
     filtered_stats_long() %>%
       group_by(receptor, treatment, passage) %>%
-      summarize(
-        auc = auc_trapz(elapsed, value_norm),
-        .groups = "drop"
-      )
+      summarize(auc = auc_trapz(elapsed, value_norm), .groups = "drop")
   })
   
   prism_wide <- reactive({
     req(auc_preview())
-    auc_df <- auc_preview() %>%
-      arrange(receptor, treatment, passage)
+    auc_df <- auc_preview() %>% arrange(receptor, treatment, passage)
     
     auc_df <- auc_df %>%
       group_by(receptor, treatment) %>%
@@ -933,8 +924,7 @@ server <- function(input, output, session) {
       select(receptor, col_key, auc) %>%
       pivot_wider(names_from = col_key, values_from = auc)
     
-    wide %>%
-      select(receptor, any_of(col_template))
+    wide %>% select(receptor, any_of(col_template))
   })
   
   output$preview_prism <- renderTable({
@@ -980,31 +970,28 @@ server <- function(input, output, session) {
           str_detect(treatment, "E2") & str_detect(treatment, "P4") ~ "Combo",
           str_detect(treatment, "E2") ~ "E2",
           str_detect(treatment, "P4") ~ "P4",
+          str_detect(treatment, "DHT|T\\b|4-OHT") ~ "Androgen",
+          str_detect(treatment, "DEX|CORT|GLUCO") ~ "Glucocorticoid",
           TRUE ~ "Other"
         ),
-        treatment_group = factor(
-          treatment_group,
-          levels = c("VEH", "E2", "P4", "Combo", "Other")
-        )
+        treatment_group = factor(treatment_group, levels = c("VEH", "E2", "P4", "Combo", "Androgen", "Glucocorticoid", "Other"))
       )
     
     dodge <- position_dodge(width = 0.6)
     
     ggplot(df, aes(x = receptor, y = auc, color = treatment_group)) +
-      geom_point(
-        position = dodge,
-        size = 2.5,
-        alpha = 0.45
-      ) +
+      geom_point(position = dodge, size = 2.5, alpha = 0.45) +
       scale_color_manual(
-        breaks = c("VEH", "E2", "P4", "Combo"),
         values = c(
           "VEH" = "#000000",
           "E2" = "#FB0280",
           "P4" = "#FD8008",
-          "Combo" = "#0F80FF",
+          "Combo" = "#C23B8E",
+          "Androgen" = "#0F80FF",
+          "Glucocorticoid" = "#00A878",
           "Other" = "#666666"
-        )
+        ),
+        breaks = c("VEH", "E2", "P4", "Combo", "Androgen", "Glucocorticoid", "Other")
       ) +
       labs(
         x = "Receptor",
@@ -1013,9 +1000,7 @@ server <- function(input, output, session) {
         title = "Combined AUC preview for current filter window"
       ) +
       theme_classic() +
-      theme(
-        axis.text.x = element_text(angle = 45, hjust = 1)
-      )
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
   })
   
   output$download_editor <- downloadHandler(
@@ -1042,15 +1027,8 @@ server <- function(input, output, session) {
       wide <- prism_wide()
       value_cols <- names(wide)[-1]
       
-      treatment_header <- c(
-        "",
-        stringr::str_replace(value_cols, "__rep\\d+$", "")
-      )
-      
-      rep_header <- c(
-        "receptor",
-        stringr::str_extract(value_cols, "rep\\d+$")
-      )
+      treatment_header <- c("", stringr::str_replace(value_cols, "__rep\\d+$", ""))
+      rep_header <- c("receptor", stringr::str_extract(value_cols, "rep\\d+$"))
       
       out <- rbind(
         treatment_header,
