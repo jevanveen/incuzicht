@@ -154,10 +154,12 @@ extract_treatment <- function(x) {
   
   hits <- character(0)
   
+  # compound-first only: E2 30 nm, P4 250 nm, DHT 30 nm
   m1 <- str_match_all(
     s,
     regex("\\b(e2|p4|dht)\\b\\s*([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\b", ignore_case = TRUE)
   )[[1]]
+  
   if (nrow(m1) > 0) {
     vals <- paste0(
       m1[, 3],
@@ -168,10 +170,12 @@ extract_treatment <- function(x) {
     hits <- c(hits, vals)
   }
   
+  # amount-first only when ligand immediately follows concentration
   m2 <- str_match_all(
     s,
-    regex("\\b([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\s*(e2|p4|dht)\\b", ignore_case = TRUE)
+    regex("\\b([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\s+(e2|p4|dht)\\b", ignore_case = TRUE)
   )[[1]]
+  
   if (nrow(m2) > 0) {
     vals <- paste0(
       m2[, 2],
@@ -184,8 +188,13 @@ extract_treatment <- function(x) {
   
   hits <- unique(hits)
   
-  if (length(hits) > 0) return(paste(sort(hits), collapse = " + "))
+  # optional: sort by ligand name for stable output
+  if (length(hits) > 0) {
+    return(paste(sort(hits), collapse = " + "))
+  }
+  
   if (veh_only) return("VEH")
+  
   "VEH"
 }
 
