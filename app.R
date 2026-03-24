@@ -14,6 +14,8 @@
 #     ar     -> AR
 #     gr     -> GR
 #     mr     -> MR
+# - Receptor combinations are canonicalized, so equivalent combos always sort identically
+# - Treatment combinations are canonicalized, so equivalent combos always sort identically
 # - Factor editor includes:
 #     * file
 #     * well_id
@@ -125,6 +127,77 @@ clean_condition_header <- function(x) {
     str_trim()
 }
 
+canonicalize_receptor_combo <- function(x) {
+  if (is.na(x) || x == "" || tolower(x) == "none") return("none")
+  
+  parts <- str_split(as.character(x), "\\s*\\+\\s*", simplify = FALSE)[[1]]
+  parts <- str_squish(parts)
+  parts <- parts[parts != ""]
+  parts <- unique(parts)
+  
+  canon_part <- function(p) {
+    z <- p %>%
+      str_to_lower() %>%
+      str_replace_all("[α]", "a") %>%
+      str_replace_all("[β]", "b") %>%
+      str_replace_all("[^a-z0-9_ ]", " ") %>%
+      str_squish()
+    
+    dplyr::case_when(
+      z %in% c("era", "er", "er a", "esr1", "er1", "er_a") ~ "ER_a",
+      z %in% c("erb", "er b", "esr2", "er2", "er_b") ~ "ER_b",
+      z %in% c("pgr", "pr") ~ "PR",
+      z %in% c("pra", "pr a", "pr_a") ~ "PR_a",
+      z %in% c("prb", "pr b", "pr_b") ~ "PR_b",
+      z %in% c("ar") ~ "AR",
+      z %in% c("gr") ~ "GR",
+      z %in% c("mr") ~ "MR",
+      z %in% c("", "none", "na") ~ "none",
+      TRUE ~ str_trim(p)
+    )
+  }
+  
+  parts <- purrr::map_chr(parts, canon_part)
+  parts <- unique(parts[parts != "none" & parts != ""])
+  
+  # if subtype present, drop generic PR
+  if (any(c("PR_a", "PR_b") %in% parts)) parts <- setdiff(parts, "PR")
+  
+  ord <- c("ER_a", "ER_b", "PR", "PR_a", "PR_b", "AR", "GR", "MR")
+  parts <- parts[order(match(parts, ord, nomatch = 999), parts)]
+  
+  if (length(parts) == 0) "none" else paste(parts, collapse = " + ")
+}
+
+canonicalize_treatment_combo <- function(x) {
+  z <- str_trim(as.character(x))
+  if (is.na(z) || z == "" || toupper(z) == "VEH") return("VEH")
+  
+  parts <- str_split(z, "\\s*\\+\\s*", simplify = FALSE)[[1]]
+  parts <- toupper(str_squish(parts))
+  parts <- parts[parts != ""]
+  parts <- unique(parts)
+  
+  get_ligand <- function(s) {
+    m <- str_match(s, "\\b(E2|P4|DHT)\\b")
+    lig <- m[, 2]
+    ifelse(is.na(lig), "ZZZ", lig)
+  }
+  
+  get_dose <- function(s) {
+    m <- str_match(s, "^([0-9]+\\.?[0-9]*)")
+    dose <- suppressWarnings(as.numeric(m[, 2]))
+    ifelse(is.na(dose), Inf, dose)
+  }
+  
+  ligand_order <- c("E2", "P4", "DHT", "ZZZ")
+  ord_lig <- match(get_ligand(parts), ligand_order)
+  ord_dose <- get_dose(parts)
+  
+  parts <- parts[order(ord_lig, ord_dose, parts)]
+  paste(parts, collapse = " + ")
+}
+
 extract_receptors <- function(x) {
   s <- clean_condition_header(x)
   recs <- c()
@@ -138,18 +211,11 @@ extract_receptors <- function(x) {
   if (str_detect(s, "\\bgr\\b|\\bglucocorticoid receptor\\b|\\bnr3c1\\b")) recs <- c(recs, "GR")
   if (str_detect(s, "\\bmr\\b|\\bmineralocorticoid receptor\\b|\\bnr3c2\\b")) recs <- c(recs, "MR")
   
-  if (any(c("PR_a", "PR_b") %in% recs)) recs <- setdiff(recs, "PR")
-  
-  order <- c("ER_a", "ER_b", "PR", "PR_a", "PR_b", "AR", "GR", "MR")
-  recs <- unique(recs)
-  recs <- recs[order(match(recs, order, nomatch = 999))]
-  
-  if (length(recs) == 0) "none" else paste(recs, collapse = " + ")
+  canonicalize_receptor_combo(paste(unique(recs), collapse = " + "))
 }
 
 extract_treatment <- function(x) {
   s <- clean_condition_header(x)
-  
   veh_only <- str_detect(s, "\\bveh\\b|\\bvehicle\\b|\\be2oh\\b|\\bethanol\\b|\\bdmso\\b")
   
   tokens <- str_split(s, "\\s+", simplify = TRUE)
@@ -171,14 +237,12 @@ extract_treatment <- function(x) {
   
   i <- 1
   while (i <= length(tokens)) {
-    
-    # skip already used tokens
     if (used[i]) {
       i <- i + 1
       next
     }
     
-    # Pattern 1: ligand-first  E2 30 nm
+    # ligand-first: E2 30 nm
     if (i + 2 <= length(tokens)) {
       if (!used[i] && !used[i + 1] && !used[i + 2] &&
           is_ligand(tokens[i]) &&
@@ -194,14 +258,13 @@ extract_treatment <- function(x) {
             normalize_ligand(tokens[i])
           )
         )
-        
         used[i:(i + 2)] <- TRUE
         i <- i + 3
         next
       }
     }
     
-    # Pattern 2: amount-first  30 nm E2
+    # amount-first: 30 nm E2
     if (i + 2 <= length(tokens)) {
       if (!used[i] && !used[i + 1] && !used[i + 2] &&
           is_num(tokens[i]) &&
@@ -217,7 +280,6 @@ extract_treatment <- function(x) {
             normalize_ligand(tokens[i + 2])
           )
         )
-        
         used[i:(i + 2)] <- TRUE
         i <- i + 3
         next
@@ -229,49 +291,19 @@ extract_treatment <- function(x) {
   
   hits <- unique(hits)
   
-  if (length(hits) > 0) {
-    return(paste(hits, collapse = " + "))
-  }
-  
+  if (length(hits) > 0) return(canonicalize_treatment_combo(paste(hits, collapse = " + ")))
   if (veh_only) return("VEH")
-  
   "VEH"
 }
 
 canonicalize_receptor_edit <- function(x) {
-  z <- x %>%
-    str_trim() %>%
-    str_to_lower() %>%
-    str_replace_all("[α]", "a") %>%
-    str_replace_all("[β]", "b") %>%
-    str_replace_all("[^a-z0-9\\s+_]", " ") %>%
-    str_squish()
-  
-  if (z %in% c("", "none", "na")) return("none")
-  
-  parts <- str_split(z, "\\s*\\+\\s*", simplify = FALSE)[[1]]
-  parts <- purrr::map_chr(parts, function(p) {
-    p <- str_squish(p)
-    dplyr::case_when(
-      p %in% c("era", "er", "er a", "esr1", "er1", "er_a") ~ "ER_a",
-      p %in% c("erb", "er b", "esr2", "er2", "er_b") ~ "ER_b",
-      p %in% c("pgr", "pr") ~ "PR",
-      p %in% c("pra", "pr a", "pr_a") ~ "PR_a",
-      p %in% c("prb", "pr b", "pr_b") ~ "PR_b",
-      p %in% c("ar") ~ "AR",
-      p %in% c("gr") ~ "GR",
-      p %in% c("mr") ~ "MR",
-      TRUE ~ str_trim(p)
-    )
-  })
-  
-  parts <- unique(parts[parts != ""])
-  if (length(parts) == 0) "none" else paste(parts, collapse = " + ")
+  canonicalize_receptor_combo(x)
 }
 
 canonicalize_treatment_edit <- function(x) {
   z <- str_trim(as.character(x))
-  if (is.na(z) || z == "") "VEH" else toupper(z)
+  if (is.na(z) || z == "") return("VEH")
+  canonicalize_treatment_combo(toupper(z))
 }
 
 canonicalize_passage_edit <- function(x) {
@@ -536,6 +568,8 @@ server <- function(input, output, session) {
       mutate(
         receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
         treatment = forcats::fct_explicit_na(treatment, na_level = "VEH"),
+        receptor = factor(purrr::map_chr(as.character(receptor), canonicalize_receptor_combo)),
+        treatment = factor(purrr::map_chr(as.character(treatment), canonicalize_treatment_combo)),
         factor_key = make_factor_key(receptor, treatment)
       ) %>%
       relocate(receptor, treatment, factor_key, .after = condition)
@@ -675,6 +709,8 @@ server <- function(input, output, session) {
         passage = factor(as.character(passage)),
         receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
         treatment = forcats::fct_explicit_na(treatment, na_level = "VEH"),
+        receptor = factor(purrr::map_chr(as.character(receptor), canonicalize_receptor_combo)),
+        treatment = factor(purrr::map_chr(as.character(treatment), canonicalize_treatment_combo)),
         factor_key = make_factor_key(receptor, treatment)
       ) %>%
       relocate(well_id, passage, receptor, treatment, factor_key, .after = condition)
