@@ -1,13 +1,9 @@
 # app.R
 # Incucyte Multi-File Import + Channel Normalization
-# - Auto-parse receptor + treatment from condition headers
-# - Parser handles headers like:
-#     "er pra E2 30 nm 0.5 ul (A1)"
-#     "er pra Veh E2OH 0.5 ul (C3)"
-#     "er pra P4 250 nm 100 mg/ml E2 30 nm 100 mg/ml (B5)"
-# - Bare "er" is interpreted as ER_a
+# - Auto-parses receptor + treatment from condition headers
+# - Extracts well IDs like A3 from headers and shows them in the editor
 # - Matching across files/channels is based on parsed factors, not raw condition strings
-# - Factor editor uses rhandsontable in LONG format (spreadsheet-like, easy to drag/fill)
+# - Factor editor uses rhandsontable in LONG format with sortable columns
 # - Passage is editable in the same factor editor table, so mixed-passage plates are supported
 # - Receptor canonical names after parsing:
 #     era/er -> ER_a
@@ -18,7 +14,14 @@
 #     ar     -> AR
 #     gr     -> GR
 #     mr     -> MR
-# - Factor editor includes n_reps = number of unique imported files contributing each raw condition
+# - Factor editor includes:
+#     * file
+#     * well_id
+#     * condition
+#     * n_reps
+#     * passage
+#     * receptor
+#     * treatment
 # - Plot tab includes:
 #     * filtered timecourse plot
 #     * combined preview AUC plot for the current filter window
@@ -48,6 +51,13 @@ extract_key_value <- function(lines, key) {
   if (length(hit) == 0) return(NA_character_)
   val <- str_match(hit[1], pat)[, 2]
   if (is.na(val)) NA_character_ else str_trim(val)
+}
+
+extract_well_id <- function(x) {
+  m <- str_match(x, "\\(([A-H][0-9]{1,2})\\)")
+  out <- m[, 2]
+  out[is.na(out)] <- ""
+  out
 }
 
 read_incucyte_header_meta <- function(path) {
@@ -96,7 +106,8 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
     ) %>%
     mutate(
       condition = as.character(condition),
-      value     = suppressWarnings(as.numeric(value))
+      value     = suppressWarnings(as.numeric(value)),
+      well_id   = extract_well_id(condition)
     )
 }
 
@@ -106,9 +117,9 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
 clean_condition_header <- function(x) {
   x %>%
     str_to_lower() %>%
-    str_replace_all("\\([a-h][0-9]{1,2}\\)", " ") %>%                  # well IDs like (A1)
-    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ul\\b", " ") %>%           # dispense vol
-    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*mg/ml\\b", " ") %>%        # stock conc
+    str_replace_all("\\([a-h][0-9]{1,2}\\)", " ") %>%           # remove well IDs like (A1)
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ul\\b", " ") %>%    # remove dispense volumes
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*mg/ml\\b", " ") %>% # remove stock concentration notes
     str_replace_all("_", " ") %>%
     str_replace_all("\\s+", " ") %>%
     str_trim()
@@ -118,7 +129,6 @@ extract_receptors <- function(x) {
   s <- clean_condition_header(x)
   recs <- c()
   
-  # specific before general
   if (str_detect(s, "\\berb\\b|\\ber b\\b|\\besr2\\b|\\ber2\\b")) recs <- c(recs, "ER_b")
   if (str_detect(s, "\\ber\\b|\\bera\\b|\\ber a\\b|\\besr1\\b|\\ber1\\b")) recs <- c(recs, "ER_a")
   if (str_detect(s, "\\bpra\\b|\\bpr a\\b")) recs <- c(recs, "PR_a")
@@ -144,7 +154,6 @@ extract_treatment <- function(x) {
   
   hits <- character(0)
   
-  # compound-first: E2 30 nm
   m1 <- str_match_all(
     s,
     regex("\\b(e2|p4|dht)\\b\\s*([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\b", ignore_case = TRUE)
@@ -159,7 +168,6 @@ extract_treatment <- function(x) {
     hits <- c(hits, vals)
   }
   
-  # amount-first: 30 nm E2
   m2 <- str_match_all(
     s,
     regex("\\b([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\s*(e2|p4|dht)\\b", ignore_case = TRUE)
@@ -181,7 +189,6 @@ extract_treatment <- function(x) {
   "VEH"
 }
 
-# Looser parser for manual edits
 canonicalize_receptor_edit <- function(x) {
   z <- x %>%
     str_trim() %>%
@@ -330,7 +337,7 @@ ui <- fluidPage(
         tabPanel(
           "Factor editor",
           br(),
-          tags$p("Edit passage, receptor, and treatment. The table supports copy/paste and drag-fill. Click 'Apply edits' when done."),
+          tags$p("Edit passage, receptor, and treatment. Columns are sortable. The table supports copy/paste and drag-fill. Click 'Apply edits' when done."),
           rHandsontableOutput("editor_table", height = "560px")
         ),
         tabPanel("Join checks", verbatimTextOutput("join_checks")),
@@ -470,7 +477,7 @@ server <- function(input, output, session) {
           condition_id = paste(file, condition, sep = " || ")
         )
     }) %>%
-      select(condition_id, file, channel, passage, vessel_name, metric, cell_type, analysis,
+      select(condition_id, file, well_id, channel, passage, vessel_name, metric, cell_type, analysis,
              datetime, elapsed, condition, value)
     
     annot <- guess_receptor_treatment(unique(dat$condition))
@@ -493,16 +500,17 @@ server <- function(input, output, session) {
       count(condition, name = "n_reps")
     
     raw_long_auto() %>%
-      distinct(condition_id, file, condition, passage, receptor, treatment, factor_key) %>%
+      distinct(condition_id, file, well_id, condition, passage, receptor, treatment, factor_key) %>%
       left_join(rep_counts, by = "condition") %>%
       mutate(
-        passage   = as.character(passage),
-        receptor  = as.character(receptor),
-        treatment = as.character(treatment),
+        well_id    = as.character(well_id),
+        passage    = as.character(passage),
+        receptor   = as.character(receptor),
+        treatment  = as.character(treatment),
         factor_key = as.character(factor_key),
-        n_reps    = as.integer(n_reps)
+        n_reps     = as.integer(n_reps)
       ) %>%
-      arrange(file, condition)
+      arrange(file, well_id, condition)
   })
   
   editor_rv <- reactiveVal(NULL)
@@ -519,7 +527,7 @@ server <- function(input, output, session) {
   output$editor_table <- renderRHandsontable({
     req(editor_rv())
     df <- editor_rv() %>%
-      select(file, condition, n_reps, passage, receptor, treatment)
+      select(file, well_id, condition, n_reps, passage, receptor, treatment)
     
     rhandsontable(
       df,
@@ -528,19 +536,25 @@ server <- function(input, output, session) {
       height = 540
     ) %>%
       hot_col("file", readOnly = TRUE) %>%
+      hot_col("well_id", readOnly = TRUE) %>%
       hot_col("condition", readOnly = TRUE) %>%
       hot_col("n_reps", readOnly = TRUE) %>%
-      hot_table(highlightCol = TRUE, highlightRow = TRUE)
+      hot_table(
+        highlightCol = TRUE,
+        highlightRow = TRUE,
+        columnSorting = TRUE,
+        manualColumnMove = TRUE
+      )
   })
   
   observe({
     if (!is.null(input$editor_table)) {
       tbl <- hot_to_r(input$editor_table)
       if (!is.null(tbl) && !is.null(editor_rv())) {
-        base <- editor_rv()
         tbl <- as_tibble(tbl) %>%
           mutate(
             file = as.character(file),
+            well_id = as.character(well_id),
             condition = as.character(condition),
             n_reps = suppressWarnings(as.integer(n_reps)),
             passage = as.character(passage),
@@ -548,13 +562,13 @@ server <- function(input, output, session) {
             treatment = as.character(treatment)
           )
         
-        # restore stable IDs by row order from current table
-        base$file <- as.character(base$file)
-        base$condition <- as.character(base$condition)
+        key_map <- editor_rv() %>%
+          transmute(condition_id, file, well_id, condition) %>%
+          distinct()
         
-        updated <- base %>%
-          select(condition_id, factor_key) %>%
-          bind_cols(tbl %>% select(file, condition, n_reps, passage, receptor, treatment))
+        updated <- tbl %>%
+          left_join(key_map, by = c("file", "well_id", "condition")) %>%
+          select(condition_id, everything())
         
         editor_rv(updated)
       }
@@ -568,6 +582,7 @@ server <- function(input, output, session) {
     
     df_edit <- editor_rv() %>%
       mutate(
+        well_id = as.character(well_id),
         passage = purrr::map_chr(passage, canonicalize_passage_edit),
         receptor = purrr::map_chr(receptor, canonicalize_receptor_edit),
         treatment = purrr::map_chr(treatment, canonicalize_treatment_edit),
@@ -576,7 +591,7 @@ server <- function(input, output, session) {
         treatment = factor(treatment),
         passage = factor(passage)
       ) %>%
-      arrange(file, condition)
+      arrange(file, well_id, condition)
     
     edited_map(df_edit)
   }, ignoreInit = TRUE)
@@ -588,6 +603,7 @@ server <- function(input, output, session) {
       req(editor_default())
       editor_default() %>%
         mutate(
+          well_id = as.character(well_id),
           passage = factor(purrr::map_chr(passage, canonicalize_passage_edit)),
           receptor = factor(purrr::map_chr(receptor, canonicalize_receptor_edit)),
           treatment = factor(purrr::map_chr(treatment, canonicalize_treatment_edit)),
@@ -612,7 +628,7 @@ server <- function(input, output, session) {
         treatment = forcats::fct_explicit_na(treatment, na_level = "VEH"),
         factor_key = make_factor_key(receptor, treatment)
       ) %>%
-      relocate(passage, receptor, treatment, factor_key, .after = condition)
+      relocate(well_id, passage, receptor, treatment, factor_key, .after = condition)
   })
   
   output$join_checks <- renderPrint({
@@ -634,7 +650,7 @@ server <- function(input, output, session) {
       )
     
     factor_summary <- rl %>%
-      distinct(condition_id, condition, passage, receptor, treatment, factor_key) %>%
+      distinct(condition_id, condition, well_id, passage, receptor, treatment, factor_key) %>%
       summarize(
         n_rows = n(),
         n_unique_factor_keys = n_distinct(factor_key),
@@ -647,7 +663,7 @@ server <- function(input, output, session) {
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
       factor_assignment_summary = factor_summary,
-      note = "Files/channels are matched by parsed factor combination (receptor + treatment). Passage is editable per imported condition row, so mixed-passage plates are supported."
+      note = "Files/channels are matched by parsed factor combination (receptor + treatment). Passage is editable per imported condition row, mixed-passage plates are supported, and well IDs are extracted from headers when present."
     )
   })
   
@@ -875,7 +891,11 @@ server <- function(input, output, session) {
     dodge <- position_dodge(width = 0.6)
     
     ggplot(df, aes(x = treatment, y = auc, color = receptor)) +
-      geom_point(position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.6), alpha = 0.75, size = 2) +
+      geom_point(
+        position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.6),
+        alpha = 0.75,
+        size = 2
+      ) +
       stat_summary(aes(group = receptor), fun = mean, geom = "line", position = dodge, linewidth = 0.8) +
       stat_summary(aes(group = receptor), fun = mean, geom = "point", position = dodge, size = 2.5) +
       labs(
