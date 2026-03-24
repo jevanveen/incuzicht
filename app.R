@@ -973,23 +973,33 @@ server <- function(input, output, session) {
       return()
     }
     
-    dodge <- position_dodge(width = 0.6)
+    df <- df %>%
+      mutate(
+        treatment_color = case_when(
+          str_detect(treatment, "VEH") ~ "#000000",
+          str_detect(treatment, "E2") & str_detect(treatment, "P4") ~ "#0F80FF",
+          str_detect(treatment, "E2") ~ "#FB0280",
+          str_detect(treatment, "P4") ~ "#FD8008",
+          TRUE ~ "#666666"
+        )
+      )
     
-    ggplot(df, aes(x = treatment, y = auc, color = receptor)) +
+    ggplot(df, aes(x = receptor, y = auc, color = treatment_color)) +
       geom_point(
-        position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.6),
-        alpha = 0.75,
-        size = 2
+        position = position_jitter(width = 0.15, height = 0),
+        size = 2.5,
+        alpha = 0.8
       ) +
-      stat_summary(aes(group = receptor), fun = mean, geom = "line", position = dodge, linewidth = 0.8) +
-      stat_summary(aes(group = receptor), fun = mean, geom = "point", position = dodge, size = 2.5) +
+      scale_color_identity() +
       labs(
-        x = "Treatment",
+        x = "Receptor",
         y = "AUC",
         title = "Combined AUC preview for current filter window"
       ) +
-      theme_minimal() +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      theme_classic() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1)
+      )
   })
   
   output$download_editor <- downloadHandler(
