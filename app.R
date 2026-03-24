@@ -1,21 +1,24 @@
 # app.R
 # Incucyte Multi-File Import + Channel Normalization
-# - Passage parsed from header as surrogate biological replicate
 # - Auto-parse receptor + treatment from condition headers
+# - Parser handles headers like:
+#     "er pra E2 30 nm 0.5 ul (A1)"
+#     "er pra Veh E2OH 0.5 ul (C3)"
+#     "er pra P4 250 nm 100 mg/ml E2 30 nm 100 mg/ml (B5)"
+# - Bare "er" is interpreted as ER_a
 # - Matching across files/channels is based on parsed factors, not raw condition strings
-#   so it is insensitive to case/spacing differences in original headers
 # - Factor editor uses rhandsontable in LONG format (spreadsheet-like, easy to drag/fill)
-# - Passage is also editable via a separate rhandsontable
+# - Passage is editable in the same factor editor table, so mixed-passage plates are supported
 # - Receptor canonical names after parsing:
-#     era -> ER_a
-#     erb -> ER_b
-#     pgr -> PR
-#     pra -> PR_a
-#     prb -> PR_b
-#     ar  -> AR
-#     gr  -> GR
-#     mr  -> MR
-# - Factor editor includes n_reps = number of unique imported files contributing each condition
+#     era/er -> ER_a
+#     erb    -> ER_b
+#     pgr/pr -> PR
+#     pra    -> PR_a
+#     prb    -> PR_b
+#     ar     -> AR
+#     gr     -> GR
+#     mr     -> MR
+# - Factor editor includes n_reps = number of unique imported files contributing each raw condition
 # - Plot tab includes:
 #     * filtered timecourse plot
 #     * combined preview AUC plot for the current filter window
@@ -83,8 +86,8 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
   
   dat %>%
     mutate(
-      datetime  = as.character(datetime),
-      elapsed   = suppressWarnings(as.numeric(elapsed))
+      datetime = as.character(datetime),
+      elapsed  = suppressWarnings(as.numeric(elapsed))
     ) %>%
     pivot_longer(
       cols = -c(datetime, elapsed),
@@ -98,30 +101,87 @@ read_incucyte_wide_conditions <- function(path, drop_stderr = TRUE) {
 }
 
 # ---------------------------
-# Receptor / treatment parsing
+# Header cleaning / parsing
 # ---------------------------
-canonicalize_receptor_token <- function(x) {
-  z <- x %>%
-    str_trim() %>%
+clean_condition_header <- function(x) {
+  x %>%
     str_to_lower() %>%
-    str_replace_all("[α]", "a") %>%
-    str_replace_all("[β]", "b") %>%
-    str_replace_all("[^a-z0-9\\s]", " ") %>%
-    str_squish()
-  
-  dplyr::case_when(
-    z %in% c("era", "er a", "esr1", "er1") ~ "ER_a",
-    z %in% c("erb", "er b", "esr2", "er2") ~ "ER_b",
-    z %in% c("pgr", "pr", "prg") ~ "PR",
-    z %in% c("pra", "pr a", "pr a isoform", "pr a iso") ~ "PR_a",
-    z %in% c("prb", "pr b", "pr b isoform", "pr b iso") ~ "PR_b",
-    z %in% c("ar", "androgen receptor", "nr3c4") ~ "AR",
-    z %in% c("gr", "glucocorticoid receptor", "nr3c1") ~ "GR",
-    z %in% c("mr", "mineralocorticoid receptor", "nr3c2") ~ "MR",
-    TRUE ~ NA_character_
-  )
+    str_replace_all("\\([a-h][0-9]{1,2}\\)", " ") %>%                  # well IDs like (A1)
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ul\\b", " ") %>%           # dispense vol
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*mg/ml\\b", " ") %>%        # stock conc
+    str_replace_all("_", " ") %>%
+    str_replace_all("\\s+", " ") %>%
+    str_trim()
 }
 
+extract_receptors <- function(x) {
+  s <- clean_condition_header(x)
+  recs <- c()
+  
+  # specific before general
+  if (str_detect(s, "\\berb\\b|\\ber b\\b|\\besr2\\b|\\ber2\\b")) recs <- c(recs, "ER_b")
+  if (str_detect(s, "\\ber\\b|\\bera\\b|\\ber a\\b|\\besr1\\b|\\ber1\\b")) recs <- c(recs, "ER_a")
+  if (str_detect(s, "\\bpra\\b|\\bpr a\\b")) recs <- c(recs, "PR_a")
+  if (str_detect(s, "\\bprb\\b|\\bpr b\\b")) recs <- c(recs, "PR_b")
+  if (str_detect(s, "\\bpgr\\b|\\bpr\\b")) recs <- c(recs, "PR")
+  if (str_detect(s, "\\bar\\b|\\bandrogen receptor\\b|\\bnr3c4\\b")) recs <- c(recs, "AR")
+  if (str_detect(s, "\\bgr\\b|\\bglucocorticoid receptor\\b|\\bnr3c1\\b")) recs <- c(recs, "GR")
+  if (str_detect(s, "\\bmr\\b|\\bmineralocorticoid receptor\\b|\\bnr3c2\\b")) recs <- c(recs, "MR")
+  
+  if (any(c("PR_a", "PR_b") %in% recs)) recs <- setdiff(recs, "PR")
+  
+  order <- c("ER_a", "ER_b", "PR", "PR_a", "PR_b", "AR", "GR", "MR")
+  recs <- unique(recs)
+  recs <- recs[order(match(recs, order, nomatch = 999))]
+  
+  if (length(recs) == 0) "none" else paste(recs, collapse = " + ")
+}
+
+extract_treatment <- function(x) {
+  s <- clean_condition_header(x)
+  
+  veh_only <- str_detect(s, "\\bveh\\b|\\bvehicle\\b|\\be2oh\\b|\\bethanol\\b|\\bdmso\\b")
+  
+  hits <- character(0)
+  
+  # compound-first: E2 30 nm
+  m1 <- str_match_all(
+    s,
+    regex("\\b(e2|p4|dht)\\b\\s*([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\b", ignore_case = TRUE)
+  )[[1]]
+  if (nrow(m1) > 0) {
+    vals <- paste0(
+      m1[, 3],
+      toupper(ifelse(m1[, 4] == "µm", "uM", m1[, 4])),
+      " ",
+      toupper(m1[, 2])
+    )
+    hits <- c(hits, vals)
+  }
+  
+  # amount-first: 30 nm E2
+  m2 <- str_match_all(
+    s,
+    regex("\\b([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\s*(e2|p4|dht)\\b", ignore_case = TRUE)
+  )[[1]]
+  if (nrow(m2) > 0) {
+    vals <- paste0(
+      m2[, 2],
+      toupper(ifelse(m2[, 3] == "µm", "uM", m2[, 3])),
+      " ",
+      toupper(m2[, 4])
+    )
+    hits <- c(hits, vals)
+  }
+  
+  hits <- unique(hits)
+  
+  if (length(hits) > 0) return(paste(sort(hits), collapse = " + "))
+  if (veh_only) return("VEH")
+  "VEH"
+}
+
+# Looser parser for manual edits
 canonicalize_receptor_edit <- function(x) {
   z <- x %>%
     str_trim() %>%
@@ -137,14 +197,14 @@ canonicalize_receptor_edit <- function(x) {
   parts <- purrr::map_chr(parts, function(p) {
     p <- str_squish(p)
     dplyr::case_when(
-      p %in% c("era", "er a", "esr1", "er1", "er_a") ~ "ER_a",
+      p %in% c("era", "er", "er a", "esr1", "er1", "er_a") ~ "ER_a",
       p %in% c("erb", "er b", "esr2", "er2", "er_b") ~ "ER_b",
-      p %in% c("pgr", "pr", "prg") ~ "PR",
-      p %in% c("pra", "pr a", "pr_a", "pr a isoform", "pr a iso") ~ "PR_a",
-      p %in% c("prb", "pr b", "pr_b", "pr b isoform", "pr b iso") ~ "PR_b",
-      p %in% c("ar", "androgen receptor", "nr3c4") ~ "AR",
-      p %in% c("gr", "glucocorticoid receptor", "nr3c1") ~ "GR",
-      p %in% c("mr", "mineralocorticoid receptor", "nr3c2") ~ "MR",
+      p %in% c("pgr", "pr") ~ "PR",
+      p %in% c("pra", "pr a", "pr_a") ~ "PR_a",
+      p %in% c("prb", "pr b", "pr_b") ~ "PR_b",
+      p %in% c("ar") ~ "AR",
+      p %in% c("gr") ~ "GR",
+      p %in% c("mr") ~ "MR",
       TRUE ~ str_trim(p)
     )
   })
@@ -155,12 +215,12 @@ canonicalize_receptor_edit <- function(x) {
 
 canonicalize_treatment_edit <- function(x) {
   z <- str_trim(as.character(x))
-  if (identical(z, "") || is.na(z)) "VEH" else z
+  if (is.na(z) || z == "") "VEH" else toupper(z)
 }
 
 canonicalize_passage_edit <- function(x) {
   z <- str_trim(as.character(x))
-  if (identical(z, "") || is.na(z)) "Passage_NA" else z
+  if (is.na(z) || z == "") "Passage_NA" else z
 }
 
 normalize_factor_key <- function(x) {
@@ -175,75 +235,14 @@ make_factor_key <- function(receptor, treatment) {
   paste(normalize_factor_key(receptor), normalize_factor_key(treatment), sep = " || ")
 }
 
-is_vehicle_token <- function(x) {
-  z <- str_to_lower(str_squish(x))
-  z %in% c("veh", "vehicle", "etoh", "ethanol", "dmso", "pbs", "media", "control")
-}
-
-parse_treatment_token <- function(x) {
-  z <- str_squish(x)
-  m <- str_match(
-    z,
-    regex("^\\s*([0-9]+\\.?[0-9]*)\\s*(pm|nm|um|µm|mm)\\s*([a-z0-9\\-]+)\\s*$",
-          ignore_case = TRUE)
-  )
-  if (all(is.na(m))) return(NA_character_)
-  
-  amount <- m[, 2]
-  unit   <- toupper(m[, 3])
-  unit   <- ifelse(unit == "µM", "uM", unit)
-  comp   <- toupper(m[, 4])
-  
-  paste0(amount, unit, " ", comp)
-}
-
-canonicalize_receptor_combo <- function(receptors) {
-  order <- c("none", "ER_a", "ER_b", "PR", "PR_a", "PR_b", "AR", "GR", "MR")
-  recs <- unique(na.omit(receptors))
-  if (length(recs) == 0) return("none")
-  recs <- recs[order(match(recs, order, nomatch = 999))]
-  paste(recs, collapse = " + ")
-}
-
 guess_receptor_treatment <- function(condition_vec) {
   tibble(condition_raw = condition_vec) %>%
     mutate(
-      condition_norm = condition_raw %>%
-        str_replace_all("\\s*\\+\\s*", " + ") %>%
-        str_squish(),
-      tokens = str_split(condition_norm, " \\+ ")
-    ) %>%
-    mutate(
-      parsed = purrr::map(tokens, function(tok) {
-        tok <- str_squish(tok)
-        
-        receptor_tokens <- purrr::map_chr(tok, canonicalize_receptor_token)
-        receptors <- receptor_tokens[!is.na(receptor_tokens)]
-        non_receptor <- tok[is.na(receptor_tokens)]
-        
-        veh_idx <- purrr::map_lgl(non_receptor, is_vehicle_token)
-        conc_parsed <- purrr::map_chr(non_receptor, parse_treatment_token)
-        conc_idx <- !is.na(conc_parsed)
-        
-        treatment <- dplyr::case_when(
-          any(conc_idx) ~ paste(unique(conc_parsed[conc_idx]), collapse = " + "),
-          any(veh_idx) ~ "VEH",
-          length(non_receptor) == 0 ~ "VEH",
-          TRUE ~ paste(non_receptor, collapse = " + ")
-        )
-        
-        list(
-          receptor = canonicalize_receptor_combo(receptors),
-          treatment = treatment
-        )
-      })
-    ) %>%
-    tidyr::unnest_wider(parsed) %>%
-    mutate(
+      receptor = purrr::map_chr(condition_raw, extract_receptors),
+      treatment = purrr::map_chr(condition_raw, extract_treatment),
       receptor = factor(receptor),
       treatment = factor(treatment)
-    ) %>%
-    select(condition_raw, receptor, treatment)
+    )
 }
 
 preview_file_lines <- function(path, n = 10) {
@@ -306,13 +305,11 @@ ui <- fluidPage(
       actionButton("run", "Import + Process", class = "btn-primary"),
       hr(),
       h4("Editing"),
-      actionButton("reset_factor_map", "Reset factor assignments"),
-      actionButton("reset_passage_map", "Reset passage assignments"),
-      actionButton("apply_factor_map", "Apply edits", class = "btn-primary"),
+      actionButton("reset_editor", "Reset editor"),
+      actionButton("apply_editor", "Apply edits", class = "btn-primary"),
       hr(),
       h4("Downloads"),
-      downloadButton("download_factor_map", "Factor assignments (csv)"),
-      downloadButton("download_passage_map", "Passage assignments (csv)"),
+      downloadButton("download_editor", "Editor table (csv)"),
       downloadButton("download_norm", "Normalized by Passage (csv)"),
       downloadButton("download_prism", "Prism AUC export (csv)")
     ),
@@ -333,11 +330,8 @@ ui <- fluidPage(
         tabPanel(
           "Factor editor",
           br(),
-          tags$p("Condition-level factors. You can edit, copy, and drag-fill cells, then click 'Apply edits'."),
-          rHandsontableOutput("factor_editor_table", height = "420px"),
-          br(),
-          tags$p("Passage labels are also editable. This lets you rename or merge passage groups before plotting/export."),
-          rHandsontableOutput("passage_editor_table", height = "240px")
+          tags$p("Edit passage, receptor, and treatment. The table supports copy/paste and drag-fill. Click 'Apply edits' when done."),
+          rHandsontableOutput("editor_table", height = "560px")
         ),
         tabPanel("Join checks", verbatimTextOutput("join_checks")),
         tabPanel("File preview", tableOutput("preview_files")),
@@ -468,15 +462,15 @@ server <- function(input, output, session) {
         mutate(
           file = file,
           channel = channel,
-          passage_raw = passage_lab,
           passage = passage_lab,
           vessel_name = meta$vessel_name[[1]] %||% NA_character_,
           metric      = meta$metric[[1]] %||% NA_character_,
           cell_type   = meta$cell_type[[1]] %||% NA_character_,
-          analysis    = meta$analysis[[1]] %||% NA_character_
+          analysis    = meta$analysis[[1]] %||% NA_character_,
+          condition_id = paste(file, condition, sep = " || ")
         )
     }) %>%
-      select(file, channel, passage_raw, passage, vessel_name, metric, cell_type, analysis,
+      select(condition_id, file, channel, passage, vessel_name, metric, cell_type, analysis,
              datetime, elapsed, condition, value)
     
     annot <- guess_receptor_treatment(unique(dat$condition))
@@ -491,7 +485,7 @@ server <- function(input, output, session) {
       relocate(receptor, treatment, factor_key, .after = condition)
   }, ignoreInit = TRUE)
   
-  factor_map_default <- reactive({
+  editor_default <- reactive({
     req(raw_long_auto())
     
     rep_counts <- raw_long_auto() %>%
@@ -499,147 +493,102 @@ server <- function(input, output, session) {
       count(condition, name = "n_reps")
     
     raw_long_auto() %>%
-      distinct(condition, receptor, treatment, factor_key) %>%
+      distinct(condition_id, file, condition, passage, receptor, treatment, factor_key) %>%
       left_join(rep_counts, by = "condition") %>%
       mutate(
-        receptor   = as.character(receptor),
-        treatment  = as.character(treatment),
+        passage   = as.character(passage),
+        receptor  = as.character(receptor),
+        treatment = as.character(treatment),
         factor_key = as.character(factor_key),
-        n_reps     = as.integer(n_reps)
+        n_reps    = as.integer(n_reps)
       ) %>%
-      arrange(condition)
+      arrange(file, condition)
   })
   
-  passage_map_default <- reactive({
-    req(raw_long_auto())
-    
-    raw_long_auto() %>%
-      distinct(file, passage_raw) %>%
-      count(passage_raw, name = "n_files") %>%
-      mutate(
-        passage = passage_raw,
-        n_files = as.integer(n_files)
-      ) %>%
-      arrange(passage_raw)
+  editor_rv <- reactiveVal(NULL)
+  
+  observeEvent(editor_default(), {
+    editor_rv(editor_default())
   })
   
-  factor_map_rv <- reactiveVal(NULL)
-  passage_map_rv <- reactiveVal(NULL)
-  
-  observeEvent(factor_map_default(), {
-    factor_map_rv(factor_map_default())
+  observeEvent(input$reset_editor, {
+    req(editor_default())
+    editor_rv(editor_default())
   })
   
-  observeEvent(passage_map_default(), {
-    passage_map_rv(passage_map_default())
-  })
-  
-  observeEvent(input$reset_factor_map, {
-    req(factor_map_default())
-    factor_map_rv(factor_map_default())
-  })
-  
-  observeEvent(input$reset_passage_map, {
-    req(passage_map_default())
-    passage_map_rv(passage_map_default())
-  })
-  
-  output$factor_editor_table <- renderRHandsontable({
-    req(factor_map_rv())
-    df <- factor_map_rv() %>%
-      select(condition, n_reps, receptor, treatment)
+  output$editor_table <- renderRHandsontable({
+    req(editor_rv())
+    df <- editor_rv() %>%
+      select(file, condition, n_reps, passage, receptor, treatment)
     
     rhandsontable(
       df,
       rowHeaders = NULL,
       stretchH = "all",
-      height = 400
+      height = 540
     ) %>%
+      hot_col("file", readOnly = TRUE) %>%
       hot_col("condition", readOnly = TRUE) %>%
       hot_col("n_reps", readOnly = TRUE) %>%
       hot_table(highlightCol = TRUE, highlightRow = TRUE)
   })
   
-  output$passage_editor_table <- renderRHandsontable({
-    req(passage_map_rv())
-    df <- passage_map_rv() %>%
-      select(passage_raw, n_files, passage)
-    
-    rhandsontable(
-      df,
-      rowHeaders = NULL,
-      stretchH = "all",
-      height = 220
-    ) %>%
-      hot_col("passage_raw", readOnly = TRUE) %>%
-      hot_col("n_files", readOnly = TRUE) %>%
-      hot_table(highlightCol = TRUE, highlightRow = TRUE)
-  })
-  
   observe({
-    if (!is.null(input$factor_editor_table)) {
-      tbl <- hot_to_r(input$factor_editor_table)
-      if (!is.null(tbl)) {
+    if (!is.null(input$editor_table)) {
+      tbl <- hot_to_r(input$editor_table)
+      if (!is.null(tbl) && !is.null(editor_rv())) {
+        base <- editor_rv()
         tbl <- as_tibble(tbl) %>%
           mutate(
+            file = as.character(file),
             condition = as.character(condition),
-            n_reps    = suppressWarnings(as.integer(n_reps)),
-            receptor  = as.character(receptor),
+            n_reps = suppressWarnings(as.integer(n_reps)),
+            passage = as.character(passage),
+            receptor = as.character(receptor),
             treatment = as.character(treatment)
           )
-        factor_map_rv(tbl)
+        
+        # restore stable IDs by row order from current table
+        base$file <- as.character(base$file)
+        base$condition <- as.character(base$condition)
+        
+        updated <- base %>%
+          select(condition_id, factor_key) %>%
+          bind_cols(tbl %>% select(file, condition, n_reps, passage, receptor, treatment))
+        
+        editor_rv(updated)
       }
     }
   })
   
-  observe({
-    if (!is.null(input$passage_editor_table)) {
-      tbl <- hot_to_r(input$passage_editor_table)
-      if (!is.null(tbl)) {
-        tbl <- as_tibble(tbl) %>%
-          mutate(
-            passage_raw = as.character(passage_raw),
-            n_files = suppressWarnings(as.integer(n_files)),
-            passage = as.character(passage)
-          )
-        passage_map_rv(tbl)
-      }
-    }
-  })
+  edited_map <- reactiveVal(NULL)
   
-  edited_factor_map <- reactiveVal(NULL)
-  edited_passage_map <- reactiveVal(NULL)
-  
-  observeEvent(input$apply_factor_map, {
-    req(factor_map_rv(), passage_map_rv())
+  observeEvent(input$apply_editor, {
+    req(editor_rv())
     
-    df_factor <- factor_map_rv() %>%
+    df_edit <- editor_rv() %>%
       mutate(
+        passage = purrr::map_chr(passage, canonicalize_passage_edit),
         receptor = purrr::map_chr(receptor, canonicalize_receptor_edit),
         treatment = purrr::map_chr(treatment, canonicalize_treatment_edit),
         factor_key = make_factor_key(receptor, treatment),
         receptor = factor(receptor),
-        treatment = factor(treatment)
+        treatment = factor(treatment),
+        passage = factor(passage)
       ) %>%
-      arrange(condition)
+      arrange(file, condition)
     
-    df_passage <- passage_map_rv() %>%
-      mutate(
-        passage = purrr::map_chr(passage, canonicalize_passage_edit)
-      ) %>%
-      arrange(passage_raw)
-    
-    edited_factor_map(df_factor)
-    edited_passage_map(df_passage)
+    edited_map(df_edit)
   }, ignoreInit = TRUE)
   
-  current_factor_map <- reactive({
-    if (!is.null(edited_factor_map())) {
-      edited_factor_map()
+  current_editor_map <- reactive({
+    if (!is.null(edited_map())) {
+      edited_map()
     } else {
-      req(factor_map_default())
-      factor_map_default() %>%
+      req(editor_default())
+      editor_default() %>%
         mutate(
+          passage = factor(purrr::map_chr(passage, canonicalize_passage_edit)),
           receptor = factor(purrr::map_chr(receptor, canonicalize_receptor_edit)),
           treatment = factor(purrr::map_chr(treatment, canonicalize_treatment_edit)),
           factor_key = make_factor_key(receptor, treatment)
@@ -647,32 +596,23 @@ server <- function(input, output, session) {
     }
   })
   
-  current_passage_map <- reactive({
-    if (!is.null(edited_passage_map())) {
-      edited_passage_map()
-    } else {
-      req(passage_map_default())
-      passage_map_default() %>%
-        mutate(
-          passage = purrr::map_chr(passage, canonicalize_passage_edit)
-        )
-    }
-  })
-  
   raw_long <- reactive({
-    req(raw_long_auto(), current_factor_map(), current_passage_map())
+    req(raw_long_auto(), current_editor_map())
     
     raw_long_auto() %>%
-      select(-receptor, -treatment, -factor_key, -passage) %>%
-      left_join(current_factor_map() %>% select(condition, receptor, treatment, factor_key), by = "condition") %>%
-      left_join(current_passage_map() %>% select(passage_raw, passage), by = "passage_raw") %>%
+      select(-passage, -receptor, -treatment, -factor_key) %>%
+      left_join(
+        current_editor_map() %>%
+          select(condition_id, passage, receptor, treatment, factor_key),
+        by = "condition_id"
+      ) %>%
       mutate(
+        passage = factor(as.character(passage)),
         receptor = forcats::fct_explicit_na(receptor, na_level = "none"),
         treatment = forcats::fct_explicit_na(treatment, na_level = "VEH"),
-        passage = factor(passage),
         factor_key = make_factor_key(receptor, treatment)
       ) %>%
-      relocate(receptor, treatment, factor_key, .after = condition)
+      relocate(passage, receptor, treatment, factor_key, .after = condition)
   })
   
   output$join_checks <- renderPrint({
@@ -680,7 +620,7 @@ server <- function(input, output, session) {
     rl <- raw_long()
     
     files_loaded <- rl %>%
-      distinct(file, channel, passage_raw, passage, vessel_name, metric, cell_type, analysis) %>%
+      distinct(file, channel, passage, vessel_name, metric, cell_type, analysis) %>%
       arrange(passage, channel, file)
     
     per_channel <- rl %>%
@@ -694,19 +634,20 @@ server <- function(input, output, session) {
       )
     
     factor_summary <- rl %>%
-      distinct(condition, receptor, treatment, factor_key) %>%
+      distinct(condition_id, condition, passage, receptor, treatment, factor_key) %>%
       summarize(
-        n_conditions = n(),
+        n_rows = n(),
         n_unique_factor_keys = n_distinct(factor_key),
         receptor_levels = paste(sort(unique(as.character(receptor))), collapse = ", "),
-        treatment_levels = paste(sort(unique(as.character(treatment))), collapse = ", ")
+        treatment_levels = paste(sort(unique(as.character(treatment))), collapse = ", "),
+        passage_levels = paste(sort(unique(as.character(passage))), collapse = ", ")
       )
     
     list(
       files_loaded = files_loaded,
       per_channel_summary = per_channel,
       factor_assignment_summary = factor_summary,
-      note = "Files/channels are matched by parsed factor combination (receptor + treatment). Passage labels are editable and can be merged or renamed."
+      note = "Files/channels are matched by parsed factor combination (receptor + treatment). Passage is editable per imported condition row, so mixed-passage plates are supported."
     )
   })
   
@@ -946,19 +887,11 @@ server <- function(input, output, session) {
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
   })
   
-  output$download_factor_map <- downloadHandler(
-    filename = function() paste0("incucyte_factor_assignments_", Sys.Date(), ".csv"),
+  output$download_editor <- downloadHandler(
+    filename = function() paste0("incucyte_editor_table_", Sys.Date(), ".csv"),
     content = function(file) {
-      req(current_factor_map())
-      write_csv(current_factor_map(), file)
-    }
-  )
-  
-  output$download_passage_map <- downloadHandler(
-    filename = function() paste0("incucyte_passage_assignments_", Sys.Date(), ".csv"),
-    content = function(file) {
-      req(current_passage_map())
-      write_csv(current_passage_map(), file)
+      req(current_editor_map())
+      write_csv(current_editor_map(), file)
     }
   )
   
