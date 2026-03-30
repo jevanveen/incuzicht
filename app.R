@@ -965,38 +965,94 @@ server <- function(input, output, session) {
       return()
     }
     
+    classify_treatment_group <- function(treatment) {
+      trt <- toupper(as.character(treatment))
+      
+      has_e2  <- str_detect(trt, "\\bE2\\b")
+      has_p4  <- str_detect(trt, "\\bP4\\b")
+      has_dht <- str_detect(trt, "\\bDHT\\b")
+      has_4oht <- str_detect(trt, "\\b4-OHT\\b")
+      has_gc  <- str_detect(trt, "\\bDEX\\b|\\bCORT\\b|\\bGLUCO\\b")
+      
+      ligands <- c(
+        if (has_e2) "E2",
+        if (has_p4) "P4",
+        if (has_dht) "DHT",
+        if (has_4oht) "4-OHT",
+        if (has_gc) "Glucocorticoid"
+      )
+      
+      if (length(ligands) == 0) return("VEH")
+      paste(ligands, collapse = " + ")
+    }
+    
+    treatment_levels <- c(
+      "VEH",
+      "E2",
+      "P4",
+      "DHT",
+      "4-OHT",
+      "Glucocorticoid",
+      "E2 + P4",
+      "E2 + DHT",
+      "E2 + 4-OHT",
+      "P4 + DHT",
+      "P4 + 4-OHT",
+      "DHT + 4-OHT",
+      "E2 + P4 + DHT",
+      "E2 + P4 + 4-OHT",
+      "E2 + DHT + 4-OHT",
+      "P4 + DHT + 4-OHT",
+      "E2 + P4 + DHT + 4-OHT"
+    )
+    
     df <- df %>%
       mutate(
-        treatment_group = case_when(
-          str_detect(treatment, "VEH") ~ "VEH",
-          str_detect(treatment, "E2") & str_detect(treatment, "P4") ~ "Combo",
-          str_detect(treatment, "E2") ~ "E2",
-          str_detect(treatment, "P4") ~ "P4",
-          str_detect(treatment, "DHT|T\\b|4-OHT") ~ "Androgen",
-          str_detect(treatment, "DEX|CORT|GLUCO") ~ "Glucocorticoid",
-          TRUE ~ "Other"
-        ),
-        treatment_group = factor(
-          treatment_group,
-          levels = c("VEH", "E2", "P4", "Combo", "Androgen", "Glucocorticoid", "Other")
-        )
+        treatment_group = purrr::map_chr(treatment, classify_treatment_group),
+        treatment_group = factor(treatment_group, levels = unique(c(
+          treatment_levels,
+          sort(setdiff(unique(treatment_group), treatment_levels))
+        )))
       )
+    
+    color_values <- c(
+      "VEH" = "#000000",
+      "E2" = "#FB0280",
+      "P4" = "#FD8008",
+      "DHT" = "#0F80FF",
+      "4-OHT" = "#7A3CFF",
+      "Glucocorticoid" = "#00A878",
+      "E2 + P4" = "#C23B8E",
+      "E2 + DHT" = "#8A4DFF",
+      "E2 + 4-OHT" = "#B04DFF",
+      "P4 + DHT" = "#7F9CFF",
+      "P4 + 4-OHT" = "#C06A88",
+      "DHT + 4-OHT" = "#4F5BFF",
+      "E2 + P4 + DHT" = "#6E63Caff",
+      "E2 + P4 + 4-OHT" = "#A04D9E",
+      "E2 + DHT + 4-OHT" = "#6A4DFF",
+      "P4 + DHT + 4-OHT" = "#5C7AAA",
+      "E2 + P4 + DHT + 4-OHT" = "#7A5A8A"
+    )
+    
+    missing_levels <- setdiff(levels(df$treatment_group), names(color_values))
+    if (length(missing_levels) > 0) {
+      extra_cols <- rep("#666666", length(missing_levels))
+      names(extra_cols) <- missing_levels
+      color_values <- c(color_values, extra_cols)
+    }
     
     dodge <- position_dodge(width = 0.6)
     
     ggplot(df, aes(x = receptor, y = auc, color = treatment_group)) +
-      geom_point(position = dodge, size = 2.5, alpha = 0.45) +
+      geom_point(
+        position = dodge,
+        size = 2.5,
+        alpha = 0.45
+      ) +
       scale_color_manual(
-        values = c(
-          "VEH" = "#000000",
-          "E2" = "#FB0280",
-          "P4" = "#FD8008",
-          "Combo" = "#C23B8E",
-          "Androgen" = "#0F80FF",
-          "Glucocorticoid" = "#00A878",
-          "Other" = "#666666"
-        ),
-        breaks = c("VEH", "E2", "P4", "Combo", "Androgen", "Glucocorticoid", "Other")
+        values = color_values,
+        drop = FALSE
       ) +
       labs(
         x = "Receptor",
@@ -1005,7 +1061,9 @@ server <- function(input, output, session) {
         title = "Combined AUC preview for current filter window"
       ) +
       theme_classic() +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1)
+      )
   })
   
   output$download_editor <- downloadHandler(
