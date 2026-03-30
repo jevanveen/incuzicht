@@ -84,6 +84,10 @@ read_incucyte_raw_table <- function(path) {
 # Canonicalization helpers
 # ---------------------------
 canonicalize_receptor_combo <- function(x) {
+  if (length(x) != 1) {
+    return(rep("none", length(x))[1])
+  }
+  
   if (is.na(x) || x == "" || tolower(x) == "none") return("none")
   
   parts <- str_split(as.character(x), "\\s*\\+\\s*", simplify = FALSE)[[1]]
@@ -126,7 +130,7 @@ canonicalize_receptor_combo <- function(x) {
 
 canonicalize_treatment_combo <- function(x) {
   z <- str_trim(as.character(x))
-  if (is.na(z) || z == "" || toupper(z) == "VEH") return("VEH")
+  if (length(z) != 1 || is.na(z) || z == "" || toupper(z) == "VEH") return("VEH")
   
   parts <- str_split(z, "\\s*\\+\\s*", simplify = FALSE)[[1]]
   parts <- toupper(str_squish(parts))
@@ -199,7 +203,6 @@ extract_receptors <- function(x) {
   if (str_detect(s, "\\berb\\b|\\ber b\\b|\\besr2\\b|\\ber2\\b")) recs <- c(recs, "ER_b")
   if (str_detect(s, "\\ber\\b|\\bera\\b|\\ber a\\b|\\besr1\\b|\\ber1\\b|\\bnoer\\b")) {
     if (str_detect(s, "\\bnoer\\b")) {
-      # preserve raw token for manual editing if desired
       recs <- c(recs, "NOER")
     } else {
       recs <- c(recs, "ER_a")
@@ -214,8 +217,7 @@ extract_receptors <- function(x) {
   
   if (length(recs) == 0) return("none")
   
-  # allow noncanonical custom receptor like NOER to survive
-  canonical <- recs[recs %in% c("ER_a","ER_b","PR","PR_a","PR_b","AR","GR","MR")]
+  canonical <- recs[recs %in% c("ER_a", "ER_b", "PR", "PR_a", "PR_b", "AR", "GR", "MR")]
   custom <- setdiff(unique(recs), canonical)
   
   canonical <- canonicalize_receptor_combo(paste(canonical, collapse = " + "))
@@ -289,7 +291,6 @@ extract_treatment <- function(x) {
   "VEH"
 }
 
-# comma-style parser
 parse_comma_header <- function(header) {
   if (str_detect(header, "Std Err")) {
     return(tibble(
@@ -325,7 +326,14 @@ parse_comma_header <- function(header) {
   )
 }
 
-# decide schema and return long table with parsed columns
+guess_receptor_treatment <- function(condition_vec) {
+  tibble(condition_raw = condition_vec) %>%
+    mutate(
+      receptor = purrr::map_chr(condition_raw, extract_receptors),
+      treatment = purrr::map_chr(condition_raw, extract_treatment)
+    )
+}
+
 read_incucyte_long <- function(path, drop_stderr = TRUE) {
   dat <- read_incucyte_raw_table(path)
   
@@ -374,14 +382,6 @@ read_incucyte_long <- function(path, drop_stderr = TRUE) {
       ) %>%
       select(datetime, elapsed, condition, well_id, replicate_id, receptor, treatment, value)
   }
-}
-
-guess_receptor_treatment <- function(condition_vec) {
-  tibble(condition_raw = condition_vec) %>%
-    mutate(
-      receptor = purrr::map_chr(condition_raw, extract_receptors),
-      treatment = purrr::map_chr(condition_raw, extract_treatment)
-    )
 }
 
 preview_file_lines <- function(path, n = 10) {
@@ -590,8 +590,6 @@ server <- function(input, output, session) {
         "Passage_NA"
       }
       
-      # If explicit replicate ids exist, use them to create distinct default passage labels
-      # while preserving the file-level default passage stem.
       dat0 %>%
         mutate(
           file = file,
@@ -606,13 +604,15 @@ server <- function(input, output, session) {
           cell_type   = meta$cell_type[[1]] %||% NA_character_,
           analysis    = meta$analysis[[1]] %||% NA_character_,
           condition_id = paste(file, condition, sep = " || "),
-          receptor = canonicalize_receptor_combo(receptor),
-          treatment = canonicalize_treatment_combo(treatment),
+          receptor = purrr::map_chr(receptor, canonicalize_receptor_combo),
+          treatment = purrr::map_chr(treatment, canonicalize_treatment_combo),
           factor_key = make_factor_key(receptor, treatment)
         ) %>%
-        select(condition_id, file, well_id, replicate_id, channel, passage,
-               vessel_name, metric, cell_type, analysis,
-               datetime, elapsed, condition, receptor, treatment, factor_key, value)
+        select(
+          condition_id, file, well_id, replicate_id, channel, passage,
+          vessel_name, metric, cell_type, analysis,
+          datetime, elapsed, condition, receptor, treatment, factor_key, value
+        )
     })
   }, ignoreInit = TRUE)
   
@@ -974,7 +974,10 @@ server <- function(input, output, session) {
           str_detect(treatment, "DEX|CORT|GLUCO") ~ "Glucocorticoid",
           TRUE ~ "Other"
         ),
-        treatment_group = factor(treatment_group, levels = c("VEH", "E2", "P4", "Combo", "Androgen", "Glucocorticoid", "Other"))
+        treatment_group = factor(
+          treatment_group,
+          levels = c("VEH", "E2", "P4", "Combo", "Androgen", "Glucocorticoid", "Other")
+        )
       )
     
     dodge <- position_dodge(width = 0.6)
