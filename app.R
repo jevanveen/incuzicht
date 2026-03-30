@@ -188,10 +188,12 @@ make_factor_key <- function(receptor, treatment) {
 clean_condition_header <- function(x) {
   x %>%
     str_to_lower() %>%
-    str_replace_all("\\([a-h][0-9]{1,2}\\)", " ") %>%
-    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ul\\b", " ") %>%
-    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*mg/ml\\b", " ") %>%
+    str_replace_all("\\([a-h][0-9]{1,2}\\)", " ") %>%            # remove well IDs like (A1)
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ul\\b", " ") %>%     # remove dispense volumes
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*mg/ml\\b", " ") %>%  # remove stock concentration notes
+    str_replace_all("([0-9]+\\.?[0-9]*)(pm|nm|um|µm|mm)\\b", "\\1 \\2") %>% # 30nM -> 30 nM
     str_replace_all("_", " ") %>%
+    str_replace_all("\\s*\\+\\s*", " + ") %>%
     str_replace_all("\\s+", " ") %>%
     str_trim()
 }
