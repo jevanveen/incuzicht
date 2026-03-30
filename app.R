@@ -14,6 +14,7 @@
 # - Receptor and treatment combinations are canonicalized
 # - Plot tab includes timecourse + AUC preview
 # - Prism export uses AUC values over the currently selected plot/filter window
+# - AUC plot can be exported as high-res PNG or SVG
 
 library(shiny)
 library(tidyverse)
@@ -188,10 +189,10 @@ make_factor_key <- function(receptor, treatment) {
 clean_condition_header <- function(x) {
   x %>%
     str_to_lower() %>%
-    str_replace_all("\\([a-h][0-9]{1,2}\\)", " ") %>%            # remove well IDs like (A1)
-    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ul\\b", " ") %>%     # remove dispense volumes
-    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*mg/ml\\b", " ") %>%  # remove stock concentration notes
-    str_replace_all("([0-9]+\\.?[0-9]*)(pm|nm|um|µm|mm)\\b", "\\1 \\2") %>% # 30nM -> 30 nM
+    str_replace_all("\\([a-h][0-9]{1,2}\\)", " ") %>%
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ul\\b", " ") %>%
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*mg/ml\\b", " ") %>%
+    str_replace_all("([0-9]+\\.?[0-9]*)(pm|nm|um|µm|mm)\\b", "\\1 \\2") %>%
     str_replace_all("_", " ") %>%
     str_replace_all("\\s*\\+\\s*", " + ") %>%
     str_replace_all("\\s+", " ") %>%
@@ -424,6 +425,70 @@ auc_trapz <- function(x, y) {
 }
 
 # ---------------------------
+# AUC plot helpers
+# ---------------------------
+classify_treatment_group <- function(treatment) {
+  trt <- toupper(as.character(treatment))
+  
+  has_e2   <- str_detect(trt, "\\bE2\\b")
+  has_p4   <- str_detect(trt, "\\bP4\\b")
+  has_dht  <- str_detect(trt, "\\bDHT\\b")
+  has_4oht <- str_detect(trt, "\\b4-OHT\\b")
+  has_gc   <- str_detect(trt, "\\bDEX\\b|\\bCORT\\b|\\bGLUCO\\b")
+  
+  ligands <- c(
+    if (has_e2) "E2",
+    if (has_p4) "P4",
+    if (has_dht) "DHT",
+    if (has_4oht) "4-OHT",
+    if (has_gc) "Glucocorticoid"
+  )
+  
+  if (length(ligands) == 0) return("VEH")
+  paste(ligands, collapse = " + ")
+}
+
+treatment_levels_master <- c(
+  "VEH",
+  "E2",
+  "P4",
+  "DHT",
+  "4-OHT",
+  "Glucocorticoid",
+  "E2 + P4",
+  "E2 + DHT",
+  "E2 + 4-OHT",
+  "P4 + DHT",
+  "P4 + 4-OHT",
+  "DHT + 4-OHT",
+  "E2 + P4 + DHT",
+  "E2 + P4 + 4-OHT",
+  "E2 + DHT + 4-OHT",
+  "P4 + DHT + 4-OHT",
+  "E2 + P4 + DHT + 4-OHT"
+)
+
+treatment_color_values <- c(
+  "VEH" = "#000000",
+  "E2" = "#FB0280",
+  "P4" = "#FD8008",
+  "DHT" = "#0F80FF",
+  "4-OHT" = "#7A3CFF",
+  "Glucocorticoid" = "#00A878",
+  "E2 + P4" = "#C23B8E",
+  "E2 + DHT" = "#8A4DFF",
+  "E2 + 4-OHT" = "#B04DFF",
+  "P4 + DHT" = "#7F9CFF",
+  "P4 + 4-OHT" = "#C06A88",
+  "DHT + 4-OHT" = "#4F5BFF",
+  "E2 + P4 + DHT" = "#6E63CA",
+  "E2 + P4 + 4-OHT" = "#A04D9E",
+  "E2 + DHT + 4-OHT" = "#6A4DFF",
+  "P4 + DHT + 4-OHT" = "#5C7AAA",
+  "E2 + P4 + DHT + 4-OHT" = "#7A5A8A"
+)
+
+# ---------------------------
 # UI
 # ---------------------------
 ui <- fluidPage(
@@ -457,7 +522,17 @@ ui <- fluidPage(
           "Plot",
           plotOutput("plot", height = 420),
           br(),
-          plotOutput("auc_plot", height = 340),
+          fluidRow(
+            column(8, plotOutput("auc_plot", height = 340)),
+            column(
+              4,
+              br(),
+              downloadButton("download_auc_plot_png", "Export AUC plot PNG"),
+              br(),
+              br(),
+              downloadButton("download_auc_plot_svg", "Export AUC plot SVG")
+            )
+          ),
           br(),
           fluidRow(
             column(4, uiOutput("plot_time_ui")),
@@ -955,87 +1030,28 @@ server <- function(input, output, session) {
       theme_minimal()
   })
   
-  output$auc_plot <- renderPlot({
+  auc_plot_obj <- reactive({
     req(auc_preview())
     df <- auc_preview()
     
     if (nrow(df) == 0 || all(!is.finite(df$auc))) {
-      plot.new()
-      text(0.5, 0.5, "No AUC values available for the current filters.")
-      return()
+      return(NULL)
     }
-    
-    classify_treatment_group <- function(treatment) {
-      trt <- toupper(as.character(treatment))
-      
-      has_e2  <- str_detect(trt, "\\bE2\\b")
-      has_p4  <- str_detect(trt, "\\bP4\\b")
-      has_dht <- str_detect(trt, "\\bDHT\\b")
-      has_4oht <- str_detect(trt, "\\b4-OHT\\b")
-      has_gc  <- str_detect(trt, "\\bDEX\\b|\\bCORT\\b|\\bGLUCO\\b")
-      
-      ligands <- c(
-        if (has_e2) "E2",
-        if (has_p4) "P4",
-        if (has_dht) "DHT",
-        if (has_4oht) "4-OHT",
-        if (has_gc) "Glucocorticoid"
-      )
-      
-      if (length(ligands) == 0) return("VEH")
-      paste(ligands, collapse = " + ")
-    }
-    
-    treatment_levels <- c(
-      "VEH",
-      "E2",
-      "P4",
-      "DHT",
-      "4-OHT",
-      "Glucocorticoid",
-      "E2 + P4",
-      "E2 + DHT",
-      "E2 + 4-OHT",
-      "P4 + DHT",
-      "P4 + 4-OHT",
-      "DHT + 4-OHT",
-      "E2 + P4 + DHT",
-      "E2 + P4 + 4-OHT",
-      "E2 + DHT + 4-OHT",
-      "P4 + DHT + 4-OHT",
-      "E2 + P4 + DHT + 4-OHT"
-    )
     
     df <- df %>%
       mutate(
         treatment_group = purrr::map_chr(treatment, classify_treatment_group),
-        treatment_group = factor(treatment_group, levels = unique(c(
-          treatment_levels,
-          sort(setdiff(unique(treatment_group), treatment_levels))
-        )))
+        treatment_group = factor(
+          treatment_group,
+          levels = unique(c(
+            treatment_levels_master,
+            sort(setdiff(unique(treatment_group), treatment_levels_master))
+          ))
+        )
       )
     
-    color_values <- c(
-      "VEH" = "#000000",
-      "E2" = "#FB0280",
-      "P4" = "#FD8008",
-      "DHT" = "#0F80FF",
-      "4-OHT" = "#7A3CFF",
-      "Glucocorticoid" = "#00A878",
-      "E2 + P4" = "#C23B8E",
-      "E2 + DHT" = "#8A4DFF",
-      "E2 + 4-OHT" = "#B04DFF",
-      "P4 + DHT" = "#7F9CFF",
-      "P4 + 4-OHT" = "#C06A88",
-      "DHT + 4-OHT" = "#4F5BFF",
-      "E2 + P4 + DHT" = "#6E63Caff",
-      "E2 + P4 + 4-OHT" = "#A04D9E",
-      "E2 + DHT + 4-OHT" = "#6A4DFF",
-      "P4 + DHT + 4-OHT" = "#5C7AAA",
-      "E2 + P4 + DHT + 4-OHT" = "#7A5A8A"
-    )
-    
-    missing_levels <- setdiff(levels(df$treatment_group), names(color_values))
+    missing_levels <- setdiff(levels(df$treatment_group), names(treatment_color_values))
+    color_values <- treatment_color_values
     if (length(missing_levels) > 0) {
       extra_cols <- rep("#666666", length(missing_levels))
       names(extra_cols) <- missing_levels
@@ -1047,12 +1063,13 @@ server <- function(input, output, session) {
     ggplot(df, aes(x = receptor, y = auc, color = treatment_group)) +
       geom_point(
         position = dodge,
-        size = 2.5,
-        alpha = 0.45
+        size = 2.8,
+        alpha = 0.5,
+        stroke = 0
       ) +
       scale_color_manual(
         values = color_values,
-        drop = FALSE
+        drop = TRUE
       ) +
       labs(
         x = "Receptor",
@@ -1060,10 +1077,27 @@ server <- function(input, output, session) {
         color = "Treatment",
         title = "Combined AUC preview for current filter window"
       ) +
-      theme_classic() +
+      theme_classic(base_size = 8) +
       theme(
-        axis.text.x = element_text(angle = 45, hjust = 1)
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 7),
+        plot.title = element_text(size = 8),
+        axis.line = element_line(linewidth = 0.4),
+        axis.ticks = element_line(linewidth = 0.4)
       )
+  })
+  
+  output$auc_plot <- renderPlot({
+    p <- auc_plot_obj()
+    if (is.null(p)) {
+      plot.new()
+      text(0.5, 0.5, "No AUC values available for the current filters.")
+      return()
+    }
+    p
   })
   
   output$download_editor <- downloadHandler(
@@ -1107,6 +1141,61 @@ server <- function(input, output, session) {
         col.names = FALSE,
         quote = TRUE,
         na = ""
+      )
+    }
+  )
+  
+  output$download_auc_plot_png <- downloadHandler(
+    filename = function() {
+      paste0("incucyte_auc_plot_", Sys.Date(), ".png")
+    },
+    content = function(file) {
+      p <- auc_plot_obj()
+      
+      if (is.null(p)) {
+        png(file, width = 1800, height = 1200, res = 300)
+        plot.new()
+        text(0.5, 0.5, "No AUC values available for the current filters.")
+        dev.off()
+        return()
+      }
+      
+      ggsave(
+        filename = file,
+        plot = p,
+        device = "png",
+        width = 89,
+        height = 70,
+        units = "mm",
+        dpi = 600,
+        bg = "white"
+      )
+    }
+  )
+  
+  output$download_auc_plot_svg <- downloadHandler(
+    filename = function() {
+      paste0("incucyte_auc_plot_", Sys.Date(), ".svg")
+    },
+    content = function(file) {
+      p <- auc_plot_obj()
+      
+      if (is.null(p)) {
+        svg(filename = file, width = 3.5, height = 2.75, bg = "white")
+        plot.new()
+        text(0.5, 0.5, "No AUC values available for the current filters.")
+        dev.off()
+        return()
+      }
+      
+      ggsave(
+        filename = file,
+        plot = p,
+        device = "svg",
+        width = 89,
+        height = 70,
+        units = "mm",
+        bg = "white"
       )
     }
   )
