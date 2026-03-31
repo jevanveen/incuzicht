@@ -1,29 +1,5 @@
 # app.R
 # Incucyte Multi-File Import + Channel Normalization
-# Supports:
-#   1) Well-style headers with well IDs, e.g. "er pra E2 30 nm 0.5 ul (A1)"
-#   2) Comma-separated condition headers, e.g. "E2 30 nM,HEK293T + ERa (1) 50K / well"
-#
-# Features
-# - Auto-parses receptor + treatment from condition headers
-# - Treatment parser supports E2, P4, DHT, 4-OHT, DEX, CORT, RU-486
-# - Extracts well IDs where present
-# - Extracts replicate IDs where present in comma-style headers
-# - Optional plate map import; plate map overrides parsed receptor/treatment/passage for matched wells
-# - Plate map visual check with auto-detected plate size and matched/unmatched wells
-# - Matching across channels is based on parsed factors, not raw condition strings
-# - Factor editor uses rhandsontable in LONG format with sortable columns
-# - Passage is editable in the same factor editor table
-# - Receptor and treatment combinations are canonicalized
-# - Plot tab includes timecourse + AUC preview
-# - Prism export uses AUC values over the currently selected plot/filter window
-# - AUC plot can be exported as high-res PNG or SVG
-# - Statistics tab:
-#     * 2-way ANOVA on AUC data
-#     * Tukey post-hoc: treatments within each receptor
-#     * Tukey post-hoc: receptors within each treatment
-#     * 3-way repeated-measures ANOVA on time data
-# - Export all stats tables as CSV
 
 library(shiny)
 library(tidyverse)
@@ -406,7 +382,7 @@ read_plate_map <- function(path) {
       cell_line = if ("cell_line" %in% names(.)) as.character(cell_line) else NA_character_,
       receptor_pm = purrr::map_chr(receptor, canonicalize_receptor_edit),
       treatment_pm = purrr::map_chr(hormone, canonicalize_treatment_edit),
-      passage_pm = dplyr::if_else(
+      passage_pm = if_else(
         is.na(passage) | str_squish(passage) == "",
         NA_character_,
         paste0("Passage_", passage)
@@ -426,7 +402,7 @@ infer_plate_size <- function(wells) {
   n_cols <- max(cols, na.rm = TRUE)
   n_total <- n_rows * n_cols
   
-  dplyr::case_when(
+  case_when(
     n_rows <= 2 && n_cols <= 3 ~ "6-well",
     n_rows <= 3 && n_cols <= 4 ~ "12-well",
     n_rows <= 4 && n_cols <= 6 ~ "24-well",
@@ -443,7 +419,7 @@ make_plate_layout <- function(wells_present, wells_matched = NULL) {
   rows <- sort(unique(str_extract(wells_present, "^[A-Z]")))
   cols <- sort(unique(suppressWarnings(as.integer(str_extract(wells_present, "[0-9]+$")))))
   
-  grid <- expand_grid(row = rows, col = cols) %>%
+  expand_grid(row = rows, col = cols) %>%
     mutate(
       well = paste0(row, col),
       in_data = well %in% wells_present,
@@ -455,13 +431,40 @@ make_plate_layout <- function(wells_present, wells_matched = NULL) {
         TRUE ~ "unmatched"
       )
     ) %>%
+    select(-in_data, -matched, -well) %>%
     pivot_wider(names_from = col, values_from = status)
-  
-  grid
 }
 
 # ---------------------------
-# Plot/stats helpers
+# Spike masking
+# ---------------------------
+mask_spikes_cooks <- function(df, value_col = "value_norm", x_col = "elapsed") {
+  y <- df[[value_col]]
+  x <- df[[x_col]]
+  ok <- is.finite(y) & is.finite(x)
+  
+  df$spike_flag <- FALSE
+  df$value_masked <- y
+  
+  if (sum(ok) < 4) return(df)
+  
+  fit <- try(lm(y[ok] ~ x[ok]), silent = TRUE)
+  if (inherits(fit, "try-error")) return(df)
+  
+  cooks <- cooks.distance(fit)
+  cutoff <- 4 / sum(ok)
+  
+  spike_idx_local <- which(cooks > cutoff)
+  if (length(spike_idx_local) == 0) return(df)
+  
+  spike_idx_global <- which(ok)[spike_idx_local]
+  df$spike_flag[spike_idx_global] <- TRUE
+  df$value_masked[spike_idx_global] <- NA_real_
+  df
+}
+
+# ---------------------------
+# Plot/stat helpers
 # ---------------------------
 preview_file_lines <- function(path, n = 10) {
   lines <- readLines(path, warn = FALSE, n = n)
@@ -478,8 +481,8 @@ ols_control_adjust <- function(df, sig_col, ctl_col) {
     return(df)
   }
   
-  fit <- stats::lm(y[ok] ~ x[ok])
-  b <- unname(stats::coef(fit)[2])
+  fit <- lm(y[ok] ~ x[ok])
+  b <- unname(coef(fit)[2])
   xbar <- mean(x[ok], na.rm = TRUE)
   
   adj <- rep(NA_real_, length(y))
@@ -554,27 +557,13 @@ ui <- fluidPage(
   titlePanel("Incucyte Multi-File Import + Channel Normalization"),
   sidebarLayout(
     sidebarPanel(
-      fileInput(
-        "files",
-        "Upload Incucyte export files (.txt/.tsv/.csv)",
-        multiple = TRUE,
-        accept = c(".txt", ".tsv", ".csv")
-      ),
-      fileInput(
-        "platemap",
-        "Upload plate map (.csv)",
-        multiple = FALSE,
-        accept = c(".csv")
-      ),
+      fileInput("files", "Upload Incucyte export files (.txt/.tsv/.csv)", multiple = TRUE, accept = c(".txt", ".tsv", ".csv")),
+      fileInput("platemap", "Upload plate map (.csv)", multiple = FALSE, accept = c(".csv")),
       checkboxInput("drop_stderr", "Drop '(Std Err ...)' columns", value = TRUE),
       uiOutput("channel_map_ui"),
       hr(),
       uiOutput("norm_ui"),
       actionButton("run", "Import + Process", class = "btn-primary"),
-      hr(),
-      h4("Editing"),
-      actionButton("reset_editor", "Reset editor"),
-      actionButton("apply_editor", "Apply edits", class = "btn-primary"),
       hr(),
       h4("Downloads"),
       downloadButton("download_editor", "Editor table (csv)"),
@@ -624,7 +613,14 @@ ui <- fluidPage(
         tabPanel(
           "Factor editor",
           br(),
-          tags$p("Edit passage, receptor, and treatment. Columns are sortable. The table supports copy/paste and drag-fill. Click 'Apply edits' when done."),
+          fluidRow(
+            column(3, actionButton("exclude_selected", "Exclude selected", class = "btn-warning")),
+            column(3, actionButton("include_selected", "Include selected")),
+            column(3, actionButton("reset_editor", "Reset edits")),
+            column(3, actionButton("apply_editor", "Apply factor edits", class = "btn-primary"))
+          ),
+          br(),
+          tags$p("Edit passage, receptor, treatment, or exclude status. Select rows and use exclude/include buttons, or edit the exclude column directly."),
           rHandsontableOutput("editor_table", height = "560px")
         ),
         tabPanel("Plate map", tableOutput("preview_platemap")),
@@ -652,7 +648,6 @@ server <- function(input, output, session) {
       tags$p(tags$small("Default: if filename contains 'red' anywhere → NIR.")),
       lapply(seq_along(fns), function(i) {
         fname <- fns[i]
-        
         default <- if (str_detect(tolower(fname), "red")) "NIR" else
           if (str_detect(tolower(fname), "nir")) "NIR" else
             if (str_detect(tolower(fname), "gfp|green")) "GFP" else
@@ -661,15 +656,7 @@ server <- function(input, output, session) {
         
         fluidRow(
           column(8, tags$small(fname)),
-          column(
-            4,
-            selectInput(
-              inputId = paste0("chan_", i),
-              label = NULL,
-              choices = c("GFP", "NIR", "Orange", "Red", "Other"),
-              selected = default
-            )
-          )
+          column(4, selectInput(paste0("chan_", i), NULL, c("GFP", "NIR", "Orange", "Red", "Other"), selected = default))
         )
       })
     )
@@ -722,12 +709,7 @@ server <- function(input, output, session) {
     tagList(
       h4("Normalization"),
       selectInput("signal_channel", "Signal channel", choices = chans, selected = chans[1]),
-      selectInput(
-        "control_channel",
-        "Control channel",
-        choices = chans,
-        selected = if ("NIR" %in% chans) "NIR" else chans[min(2, length(chans))]
-      ),
+      selectInput("control_channel", "Control channel", choices = chans, selected = if ("NIR" %in% chans) "NIR" else chans[min(2, length(chans))]),
       radioButtons(
         "norm_method",
         "Method",
@@ -739,11 +721,8 @@ server <- function(input, output, session) {
         ),
         selected = "ratio"
       ),
-      checkboxInput(
-        "baseline_norm",
-        "Also baseline-normalize within Passage+Factor combination",
-        value = FALSE
-      )
+      checkboxInput("baseline_norm", "Also baseline-normalize within Passage+Factor combination", value = FALSE),
+      checkboxInput("mask_spikes", "Mask spikes (Cook's distance > 4/n)", value = TRUE)
     )
   })
   
@@ -765,11 +744,7 @@ server <- function(input, output, session) {
           file = file,
           channel = channel,
           well_id = toupper(str_squish(well_id)),
-          passage = if_else(
-            replicate_id != "",
-            paste0(default_passage, "_rep", replicate_id),
-            default_passage
-          ),
+          passage = if_else(replicate_id != "", paste0(default_passage, "_rep", replicate_id), default_passage),
           vessel_name = meta$vessel_name[[1]] %||% NA_character_,
           metric      = meta$metric[[1]] %||% NA_character_,
           cell_type   = meta$cell_type[[1]] %||% NA_character_,
@@ -791,9 +766,7 @@ server <- function(input, output, session) {
       }
       
       dat0 %>%
-        mutate(
-          factor_key = make_factor_key(receptor, treatment)
-        ) %>%
+        mutate(factor_key = make_factor_key(receptor, treatment)) %>%
         select(
           condition_id, file, well_id, replicate_id, channel, passage,
           vessel_name, metric, cell_type, analysis,
@@ -809,7 +782,7 @@ server <- function(input, output, session) {
     
     if (is.null(input$platemap)) {
       cat("Detected data plate size:", plate_size_data, "\n")
-      cat("No plate map uploaded.")
+      cat("No plate map uploaded.\n")
     } else {
       pm <- plate_map_tbl()
       wells_pm <- pm$well
@@ -853,6 +826,7 @@ server <- function(input, output, session) {
       distinct(condition_id, file, well_id, replicate_id, condition, passage, receptor, treatment, factor_key) %>%
       left_join(rep_counts, by = "condition") %>%
       mutate(
+        exclude = FALSE,
         well_id = as.character(well_id),
         replicate_id = as.character(replicate_id),
         passage = as.character(passage),
@@ -878,9 +852,10 @@ server <- function(input, output, session) {
   output$editor_table <- renderRHandsontable({
     req(editor_rv())
     df <- editor_rv() %>%
-      select(file, well_id, replicate_id, condition, n_reps, passage, receptor, treatment)
+      select(exclude, file, well_id, replicate_id, condition, n_reps, passage, receptor, treatment)
     
     rhandsontable(df, rowHeaders = NULL, stretchH = "all", height = 540) %>%
+      hot_col("exclude", type = "checkbox") %>%
       hot_col("file", readOnly = TRUE) %>%
       hot_col("well_id", readOnly = TRUE) %>%
       hot_col("replicate_id", readOnly = TRUE) %>%
@@ -895,6 +870,7 @@ server <- function(input, output, session) {
       if (!is.null(tbl) && !is.null(editor_rv())) {
         tbl <- as_tibble(tbl) %>%
           mutate(
+            exclude = as.logical(exclude),
             file = as.character(file),
             well_id = as.character(well_id),
             replicate_id = as.character(replicate_id),
@@ -918,6 +894,28 @@ server <- function(input, output, session) {
     }
   })
   
+  observeEvent(input$exclude_selected, {
+    req(editor_rv(), input$editor_table_select$select$r)
+    rows <- input$editor_table_select$select$r
+    df <- editor_rv()
+    rows <- rows[rows >= 1 & rows <= nrow(df)]
+    if (length(rows) > 0) {
+      df$exclude[rows] <- TRUE
+      editor_rv(df)
+    }
+  })
+  
+  observeEvent(input$include_selected, {
+    req(editor_rv(), input$editor_table_select$select$r)
+    rows <- input$editor_table_select$select$r
+    df <- editor_rv()
+    rows <- rows[rows >= 1 & rows <= nrow(df)]
+    if (length(rows) > 0) {
+      df$exclude[rows] <- FALSE
+      editor_rv(df)
+    }
+  })
+  
   edited_map <- reactiveVal(NULL)
   
   observeEvent(input$apply_editor, {
@@ -925,6 +923,7 @@ server <- function(input, output, session) {
     
     df_edit <- editor_rv() %>%
       mutate(
+        exclude = if_else(is.na(exclude), FALSE, as.logical(exclude)),
         well_id = as.character(well_id),
         replicate_id = as.character(replicate_id),
         passage = purrr::map_chr(passage, canonicalize_passage_edit),
@@ -947,6 +946,7 @@ server <- function(input, output, session) {
       req(editor_default())
       editor_default() %>%
         mutate(
+          exclude = if_else(is.na(exclude), FALSE, as.logical(exclude)),
           well_id = as.character(well_id),
           replicate_id = as.character(replicate_id),
           passage = factor(purrr::map_chr(passage, canonicalize_passage_edit)),
@@ -963,16 +963,18 @@ server <- function(input, output, session) {
     raw_long_auto() %>%
       select(-passage, -receptor, -treatment, -factor_key) %>%
       left_join(
-        current_editor_map() %>% select(condition_id, passage, receptor, treatment, factor_key),
+        current_editor_map() %>% select(condition_id, exclude, passage, receptor, treatment, factor_key),
         by = "condition_id"
       ) %>%
       mutate(
+        exclude = if_else(is.na(exclude), FALSE, as.logical(exclude)),
         passage = factor(as.character(passage)),
         receptor = factor(purrr::map_chr(as.character(receptor), canonicalize_receptor_combo)),
         treatment = factor(purrr::map_chr(as.character(treatment), canonicalize_treatment_combo)),
         factor_key = make_factor_key(receptor, treatment)
       ) %>%
-      relocate(well_id, replicate_id, passage, receptor, treatment, factor_key, .after = condition)
+      filter(!exclude) %>%
+      relocate(exclude, well_id, replicate_id, passage, receptor, treatment, factor_key, .after = condition)
   })
   
   output$join_checks <- renderPrint({
@@ -1022,39 +1024,50 @@ server <- function(input, output, session) {
     ctl <- input$control_channel
     
     if (is.null(sig) || is.null(ctl) || !(sig %in% names(w)) || !(ctl %in% names(w))) {
-      return(w %>% mutate(value_norm = NA_real_))
-    }
-    
-    out <- w
-    
-    if (method %in% c("none", "ratio", "log2ratio")) {
-      out <- out %>%
-        mutate(
-          value_norm = dplyr::case_when(
-            method == "none" ~ .data[[sig]],
-            method == "ratio" ~ .data[[sig]] / .data[[ctl]],
-            method == "log2ratio" ~ log2(.data[[sig]] / .data[[ctl]]),
-            TRUE ~ NA_real_
-          )
-        )
-    } else if (method == "ols_adj") {
-      out <- out %>%
-        group_by(passage, factor_key) %>%
-        group_modify(~ ols_control_adjust(.x, sig_col = sig, ctl_col = ctl)) %>%
-        ungroup()
+      out <- w %>% mutate(value_norm = NA_real_)
     } else {
-      out <- out %>% mutate(value_norm = NA_real_)
+      out <- w
+      
+      if (method %in% c("none", "ratio", "log2ratio")) {
+        out <- out %>%
+          mutate(
+            value_norm = case_when(
+              method == "none" ~ .data[[sig]],
+              method == "ratio" ~ .data[[sig]] / .data[[ctl]],
+              method == "log2ratio" ~ log2(.data[[sig]] / .data[[ctl]]),
+              TRUE ~ NA_real_
+            )
+          )
+      } else if (method == "ols_adj") {
+        out <- out %>%
+          group_by(passage, factor_key) %>%
+          group_modify(~ ols_control_adjust(.x, sig_col = sig, ctl_col = ctl)) %>%
+          ungroup()
+      } else {
+        out <- out %>% mutate(value_norm = NA_real_)
+      }
+      
+      if (isTRUE(input$baseline_norm)) {
+        out <- out %>%
+          group_by(passage, factor_key) %>%
+          mutate(
+            baseline = value_norm[which(!is.na(value_norm))[1]],
+            value_norm = value_norm / baseline
+          ) %>%
+          ungroup() %>%
+          select(-baseline)
+      }
     }
     
-    if (isTRUE(input$baseline_norm)) {
+    if (isTRUE(input$mask_spikes)) {
       out <- out %>%
         group_by(passage, factor_key) %>%
-        mutate(
-          baseline = value_norm[which(!is.na(value_norm))[1]],
-          value_norm = value_norm / baseline
-        ) %>%
+        group_modify(~ mask_spikes_cooks(.x, value_col = "value_norm", x_col = "elapsed")) %>%
         ungroup() %>%
-        select(-baseline)
+        mutate(value_norm = value_masked) %>%
+        select(-value_masked)
+    } else {
+      out <- out %>% mutate(spike_flag = FALSE)
     }
     
     out
@@ -1068,7 +1081,7 @@ server <- function(input, output, session) {
   stats_long <- reactive({
     req(normalized_passage())
     normalized_passage() %>%
-      select(passage, elapsed, receptor, treatment, factor_key, value_norm) %>%
+      select(passage, elapsed, receptor, treatment, factor_key, value_norm, spike_flag) %>%
       arrange(receptor, treatment, passage, elapsed)
   })
   
@@ -1263,15 +1276,11 @@ server <- function(input, output, session) {
       need(n_distinct(df$subject_id) >= 2, "Need at least 2 repeated subjects/replicates for time ANOVA.")
     )
     
-    aov(
-      value_norm ~ receptor * treatment * elapsed_f + Error(subject_id / elapsed_f),
-      data = df
-    )
+    aov(value_norm ~ receptor * treatment * elapsed_f + Error(subject_id / elapsed_f), data = df)
   })
   
   auc_stats_df <- reactive({
     req(auc_preview())
-    
     auc_preview() %>%
       mutate(
         receptor = factor(receptor),
@@ -1309,14 +1318,7 @@ server <- function(input, output, session) {
       })
     
     if (nrow(out) == 0) {
-      tibble(
-        receptor = character(),
-        comparison = character(),
-        diff = numeric(),
-        lwr = numeric(),
-        upr = numeric(),
-        `p adj` = numeric()
-      )
+      tibble(receptor = character(), comparison = character(), diff = numeric(), lwr = numeric(), upr = numeric(), `p adj` = numeric())
     } else out
   })
   
@@ -1337,14 +1339,7 @@ server <- function(input, output, session) {
       })
     
     if (nrow(out) == 0) {
-      tibble(
-        treatment = character(),
-        comparison = character(),
-        diff = numeric(),
-        lwr = numeric(),
-        upr = numeric(),
-        `p adj` = numeric()
-      )
+      tibble(treatment = character(), comparison = character(), diff = numeric(), lwr = numeric(), upr = numeric(), `p adj` = numeric())
     } else out
   })
   
@@ -1383,14 +1378,10 @@ server <- function(input, output, session) {
       wide <- prism_wide()
       value_cols <- names(wide)[-1]
       
-      treatment_header <- c("", stringr::str_replace(value_cols, "__rep\\d+$", ""))
-      rep_header <- c("receptor", stringr::str_extract(value_cols, "rep\\d+$"))
+      treatment_header <- c("", str_replace(value_cols, "__rep\\d+$", ""))
+      rep_header <- c("receptor", str_extract(value_cols, "rep\\d+$"))
       
-      out <- rbind(
-        treatment_header,
-        rep_header,
-        as.matrix(wide)
-      )
+      out <- rbind(treatment_header, rep_header, as.matrix(wide))
       
       write.table(
         out,
@@ -1472,14 +1463,13 @@ server <- function(input, output, session) {
       auc_receptor_tbl <- auc_tukey_receptor_within_treatment_df() %>%
         mutate(table = "auc_tukey_receptor_within_treatment", .before = 1)
       
-      all_tbl <- bind_rows(
+      bind_rows(
         suppressWarnings(auc_anova_tbl),
         suppressWarnings(time_anova_tbl),
         suppressWarnings(auc_treat_tbl),
         suppressWarnings(auc_receptor_tbl)
-      )
-      
-      write_csv(all_tbl, file)
+      ) %>%
+        write_csv(file)
     }
   )
 }
