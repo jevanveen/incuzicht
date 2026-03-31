@@ -15,6 +15,11 @@
 # - Plot tab includes timecourse + AUC preview
 # - Prism export uses AUC values over the currently selected plot/filter window
 # - AUC plot can be exported as high-res PNG or SVG
+# - Statistics tab includes:
+#     * 3-way repeated-measures ANOVA for time data: receptor * treatment * elapsed
+#     * Tukey post-hoc group comparisons at each elapsed time
+#     * 2-way ANOVA for AUC data: receptor * treatment
+#     * Tukey post-hoc comparisons between receptor:treatment groups
 
 library(shiny)
 library(tidyverse)
@@ -85,10 +90,7 @@ read_incucyte_raw_table <- function(path) {
 # Canonicalization helpers
 # ---------------------------
 canonicalize_receptor_combo <- function(x) {
-  if (length(x) != 1) {
-    return(rep("none", length(x))[1])
-  }
-  
+  if (length(x) != 1) return("none")
   if (is.na(x) || x == "" || tolower(x) == "none") return("none")
   
   parts <- str_split(as.character(x), "\\s*\\+\\s*", simplify = FALSE)[[1]]
@@ -539,6 +541,22 @@ ui <- fluidPage(
             column(4, uiOutput("plot_receptor_ui")),
             column(4, uiOutput("plot_treatment_ui"))
           )
+        ),
+        tabPanel(
+          "Statistics",
+          br(),
+          h4("3-way repeated-measures ANOVA on time data"),
+          verbatimTextOutput("time_anova_out"),
+          br(),
+          h5("Tukey post-hoc comparisons between groups at each elapsed time"),
+          tableOutput("time_tukey_out"),
+          br(),
+          hr(),
+          h4("Two-way ANOVA on AUC data"),
+          verbatimTextOutput("auc_anova_out"),
+          br(),
+          h5("Tukey post-hoc comparisons between receptor:treatment groups"),
+          tableOutput("auc_tukey_out")
         ),
         tabPanel(
           "Factor editor",
@@ -1058,7 +1076,7 @@ server <- function(input, output, session) {
       color_values <- c(color_values, extra_cols)
     }
     
-    dodge <- position_dodge(width = 0.6)
+    dodge <- position_dodge(width = 0.8)
     
     ggplot(df, aes(x = receptor, y = auc, color = treatment_group)) +
       geom_point(
@@ -1100,6 +1118,134 @@ server <- function(input, output, session) {
     p
   })
   
+  # ---------------------------
+  # Statistics
+  # ---------------------------
+  time_stats_df <- reactive({
+    req(filtered_stats_long())
+    
+    filtered_stats_long() %>%
+      mutate(
+        receptor = factor(receptor),
+        treatment = factor(treatment),
+        elapsed_f = factor(elapsed),
+        subject_id = factor(passage)
+      ) %>%
+      filter(is.finite(value_norm))
+  })
+  
+  time_rm_fit <- reactive({
+    df <- time_stats_df()
+    
+    validate(
+      need(nrow(df) > 0, "No time-course data available for repeated-measures ANOVA."),
+      need(n_distinct(df$receptor) >= 2, "Need at least 2 receptor levels for time ANOVA."),
+      need(n_distinct(df$treatment) >= 2, "Need at least 2 treatment levels for time ANOVA."),
+      need(n_distinct(df$elapsed_f) >= 2, "Need at least 2 elapsed timepoints for time ANOVA."),
+      need(n_distinct(df$subject_id) >= 2, "Need at least 2 repeated subjects/replicates for time ANOVA.")
+    )
+    
+    aov(
+      value_norm ~ receptor * treatment * elapsed_f + Error(subject_id / elapsed_f),
+      data = df
+    )
+  })
+  
+  time_tukey_df <- reactive({
+    df <- time_stats_df() %>%
+      mutate(group = interaction(receptor, treatment, sep = " | ", drop = TRUE))
+    
+    validate(
+      need(nrow(df) > 0, "No time-course data available for Tukey post-hoc tests.")
+    )
+    
+    out <- split(df, df$elapsed_f) |>
+      purrr::imap_dfr(function(d, t_lab) {
+        if (n_distinct(d$group) < 2) return(NULL)
+        
+        fit <- try(aov(value_norm ~ group, data = d), silent = TRUE)
+        if (inherits(fit, "try-error")) return(NULL)
+        
+        tk <- try(TukeyHSD(fit, "group"), silent = TRUE)
+        if (inherits(tk, "try-error")) return(NULL)
+        
+        as.data.frame(tk$group) %>%
+          tibble::rownames_to_column("comparison") %>%
+          mutate(elapsed = as.character(t_lab), .before = 1)
+      })
+    
+    if (nrow(out) == 0) {
+      tibble(
+        elapsed = character(),
+        comparison = character(),
+        diff = numeric(),
+        lwr = numeric(),
+        upr = numeric(),
+        `p adj` = numeric()
+      )
+    } else {
+      out
+    }
+  })
+  
+  auc_stats_df <- reactive({
+    req(auc_preview())
+    
+    auc_preview() %>%
+      mutate(
+        receptor = factor(receptor),
+        treatment = factor(treatment),
+        group = interaction(receptor, treatment, sep = " | ", drop = TRUE)
+      ) %>%
+      filter(is.finite(auc))
+  })
+  
+  auc_anova_fit <- reactive({
+    df <- auc_stats_df()
+    
+    validate(
+      need(nrow(df) > 0, "No AUC data available for ANOVA."),
+      need(n_distinct(df$receptor) >= 2, "Need at least 2 receptor levels for AUC ANOVA."),
+      need(n_distinct(df$treatment) >= 2, "Need at least 2 treatment levels for AUC ANOVA.")
+    )
+    
+    aov(auc ~ receptor * treatment, data = df)
+  })
+  
+  auc_tukey_df <- reactive({
+    df <- auc_stats_df()
+    
+    validate(
+      need(nrow(df) > 0, "No AUC data available for Tukey post-hoc tests."),
+      need(n_distinct(df$group) >= 2, "Need at least 2 groups for AUC Tukey post-hoc tests.")
+    )
+    
+    fit <- aov(auc ~ group, data = df)
+    tk <- TukeyHSD(fit, "group")
+    
+    as.data.frame(tk$group) %>%
+      tibble::rownames_to_column("comparison")
+  })
+  
+  output$time_anova_out <- renderPrint({
+    summary(time_rm_fit())
+  })
+  
+  output$time_tukey_out <- renderTable({
+    time_tukey_df()
+  }, striped = TRUE)
+  
+  output$auc_anova_out <- renderPrint({
+    summary(auc_anova_fit())
+  })
+  
+  output$auc_tukey_out <- renderTable({
+    auc_tukey_df()
+  }, striped = TRUE)
+  
+  # ---------------------------
+  # Downloads
+  # ---------------------------
   output$download_editor <- downloadHandler(
     filename = function() paste0("incucyte_editor_table_", Sys.Date(), ".csv"),
     content = function(file) {
