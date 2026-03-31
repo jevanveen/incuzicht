@@ -1,25 +1,5 @@
 # app.R
 # Incucyte Multi-File Import + Channel Normalization
-# Supports two header schemas:
-#   1) Well-style headers with well IDs, e.g. "er pra E2 30 nm 0.5 ul (A1)"
-#   2) Comma-separated condition headers, e.g. "E2 30 nM,HEK293T + ERa (1) 50K / well"
-#
-# Features
-# - Auto-parses receptor + treatment from condition headers
-# - Extracts well IDs where present
-# - Extracts explicit replicate IDs where present in comma-style headers
-# - Matching across files/channels is based on parsed factors, not raw condition strings
-# - Factor editor uses rhandsontable in LONG format with sortable columns
-# - Passage is editable in the same factor editor table
-# - Receptor and treatment combinations are canonicalized
-# - Plot tab includes timecourse + AUC preview
-# - Prism export uses AUC values over the currently selected plot/filter window
-# - AUC plot can be exported as high-res PNG or SVG
-# - Statistics tab includes:
-#     * 3-way repeated-measures ANOVA for time data: receptor * treatment * elapsed
-#     * Tukey post-hoc group comparisons at each elapsed time
-#     * 2-way ANOVA for AUC data: receptor * treatment
-#     * Tukey post-hoc comparisons between receptor:treatment groups
 
 library(shiny)
 library(tidyverse)
@@ -29,9 +9,6 @@ library(rhandsontable)
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
-# ---------------------------
-# Low-level file helpers
-# ---------------------------
 find_data_header_row <- function(lines) {
   idx <- which(str_detect(lines, "^Date Time\\tElapsed\\b"))
   if (length(idx) == 0) return(NA_integer_)
@@ -86,9 +63,6 @@ read_incucyte_raw_table <- function(path) {
   dat
 }
 
-# ---------------------------
-# Canonicalization helpers
-# ---------------------------
 canonicalize_receptor_combo <- function(x) {
   if (length(x) != 1) return("none")
   if (is.na(x) || x == "" || tolower(x) == "none") return("none")
@@ -185,9 +159,6 @@ make_factor_key <- function(receptor, treatment) {
   paste(normalize_factor_key(receptor), normalize_factor_key(treatment), sep = " || ")
 }
 
-# ---------------------------
-# Parser helpers
-# ---------------------------
 clean_condition_header <- function(x) {
   x %>%
     str_to_lower() %>%
@@ -342,9 +313,7 @@ guess_receptor_treatment <- function(condition_vec) {
 read_incucyte_long <- function(path, drop_stderr = TRUE) {
   dat <- read_incucyte_raw_table(path)
   
-  if (drop_stderr) {
-    dat <- dat %>% select(-matches("Std Err"))
-  }
+  if (drop_stderr) dat <- dat %>% select(-matches("Std Err"))
   
   cond_names <- names(dat)[-(1:2)]
   is_comma_schema <- any(str_detect(cond_names, ","))
@@ -426,9 +395,6 @@ auc_trapz <- function(x, y) {
   sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
 }
 
-# ---------------------------
-# AUC plot helpers
-# ---------------------------
 classify_treatment_group <- function(treatment) {
   trt <- toupper(as.character(treatment))
   
@@ -451,22 +417,9 @@ classify_treatment_group <- function(treatment) {
 }
 
 treatment_levels_master <- c(
-  "VEH",
-  "E2",
-  "P4",
-  "DHT",
-  "4-OHT",
-  "Glucocorticoid",
-  "E2 + P4",
-  "E2 + DHT",
-  "E2 + 4-OHT",
-  "P4 + DHT",
-  "P4 + 4-OHT",
-  "DHT + 4-OHT",
-  "E2 + P4 + DHT",
-  "E2 + P4 + 4-OHT",
-  "E2 + DHT + 4-OHT",
-  "P4 + DHT + 4-OHT",
+  "VEH","E2","P4","DHT","4-OHT","Glucocorticoid",
+  "E2 + P4","E2 + DHT","E2 + 4-OHT","P4 + DHT","P4 + 4-OHT","DHT + 4-OHT",
+  "E2 + P4 + DHT","E2 + P4 + 4-OHT","E2 + DHT + 4-OHT","P4 + DHT + 4-OHT",
   "E2 + P4 + DHT + 4-OHT"
 )
 
@@ -490,9 +443,6 @@ treatment_color_values <- c(
   "E2 + P4 + DHT + 4-OHT" = "#7A5A8A"
 )
 
-# ---------------------------
-# UI
-# ---------------------------
 ui <- fluidPage(
   titlePanel("Incucyte Multi-File Import + Channel Normalization"),
   sidebarLayout(
@@ -516,7 +466,8 @@ ui <- fluidPage(
       h4("Downloads"),
       downloadButton("download_editor", "Editor table (csv)"),
       downloadButton("download_norm", "Normalized by Passage (csv)"),
-      downloadButton("download_prism", "Prism AUC export (csv)")
+      downloadButton("download_prism", "Prism AUC export (csv)"),
+      downloadButton("download_stats_csv", "Export all stats CSV")
     ),
     mainPanel(
       tabsetPanel(
@@ -530,8 +481,7 @@ ui <- fluidPage(
               4,
               br(),
               downloadButton("download_auc_plot_png", "Export AUC plot PNG"),
-              br(),
-              br(),
+              br(), br(),
               downloadButton("download_auc_plot_svg", "Export AUC plot SVG")
             )
           ),
@@ -545,18 +495,18 @@ ui <- fluidPage(
         tabPanel(
           "Statistics",
           br(),
-          h4("3-way repeated-measures ANOVA on time data"),
-          verbatimTextOutput("time_anova_out"),
-          br(),
-          h5("Tukey post-hoc comparisons between groups at each elapsed time"),
-          tableOutput("time_tukey_out"),
-          br(),
-          hr(),
           h4("Two-way ANOVA on AUC data"),
           verbatimTextOutput("auc_anova_out"),
           br(),
-          h5("Tukey post-hoc comparisons between receptor:treatment groups"),
-          tableOutput("auc_tukey_out")
+          h5("Tukey post-hoc: treatments within each receptor"),
+          tableOutput("auc_tukey_treat_within_receptor"),
+          br(),
+          h5("Tukey post-hoc: receptors within each treatment"),
+          tableOutput("auc_tukey_receptor_within_treatment"),
+          br(),
+          hr(),
+          h4("3-way repeated-measures ANOVA on time data"),
+          verbatimTextOutput("time_anova_out")
         ),
         tabPanel(
           "Factor editor",
@@ -573,9 +523,6 @@ ui <- fluidPage(
   )
 )
 
-# ---------------------------
-# Server
-# ---------------------------
 server <- function(input, output, session) {
   
   output$channel_map_ui <- renderUI({
@@ -869,8 +816,7 @@ server <- function(input, output, session) {
           receptor_levels = paste(sort(unique(as.character(receptor))), collapse = ", "),
           treatment_levels = paste(sort(unique(as.character(treatment))), collapse = ", "),
           passage_levels = paste(sort(unique(as.character(passage))), collapse = ", ")
-        ),
-      note = "Supports both well-style and comma-separated Incucyte header schemas. In comma-style files, replicate IDs like '(1)' are extracted and used in the default passage labels."
+        )
     )
   })
   
@@ -977,8 +923,7 @@ server <- function(input, output, session) {
     df <- stats_long()
     
     if (!is.null(input$plot_time_range)) {
-      df <- df %>%
-        filter(elapsed >= input$plot_time_range[1], elapsed <= input$plot_time_range[2])
+      df <- df %>% filter(elapsed >= input$plot_time_range[1], elapsed <= input$plot_time_range[2])
     }
     if (!is.null(input$plot_receptors) && length(input$plot_receptors) > 0) {
       df <- df %>% filter(as.character(receptor) %in% input$plot_receptors)
@@ -1052,9 +997,7 @@ server <- function(input, output, session) {
     req(auc_preview())
     df <- auc_preview()
     
-    if (nrow(df) == 0 || all(!is.finite(df$auc))) {
-      return(NULL)
-    }
+    if (nrow(df) == 0 || all(!is.finite(df$auc))) return(NULL)
     
     df <- df %>%
       mutate(
@@ -1079,16 +1022,8 @@ server <- function(input, output, session) {
     dodge <- position_dodge(width = 0.8)
     
     ggplot(df, aes(x = receptor, y = auc, color = treatment_group)) +
-      geom_point(
-        position = dodge,
-        size = 2.8,
-        alpha = 0.5,
-        stroke = 0
-      ) +
-      scale_color_manual(
-        values = color_values,
-        drop = TRUE
-      ) +
+      geom_point(position = dodge, size = 2.8, alpha = 0.5, stroke = 0) +
+      scale_color_manual(values = color_values, drop = TRUE) +
       labs(
         x = "Receptor",
         y = "AUC",
@@ -1151,51 +1086,13 @@ server <- function(input, output, session) {
     )
   })
   
-  time_tukey_df <- reactive({
-    df <- time_stats_df() %>%
-      mutate(group = interaction(receptor, treatment, sep = " | ", drop = TRUE))
-    
-    validate(
-      need(nrow(df) > 0, "No time-course data available for Tukey post-hoc tests.")
-    )
-    
-    out <- split(df, df$elapsed_f) |>
-      purrr::imap_dfr(function(d, t_lab) {
-        if (n_distinct(d$group) < 2) return(NULL)
-        
-        fit <- try(aov(value_norm ~ group, data = d), silent = TRUE)
-        if (inherits(fit, "try-error")) return(NULL)
-        
-        tk <- try(TukeyHSD(fit, "group"), silent = TRUE)
-        if (inherits(tk, "try-error")) return(NULL)
-        
-        as.data.frame(tk$group) %>%
-          tibble::rownames_to_column("comparison") %>%
-          mutate(elapsed = as.character(t_lab), .before = 1)
-      })
-    
-    if (nrow(out) == 0) {
-      tibble(
-        elapsed = character(),
-        comparison = character(),
-        diff = numeric(),
-        lwr = numeric(),
-        upr = numeric(),
-        `p adj` = numeric()
-      )
-    } else {
-      out
-    }
-  })
-  
   auc_stats_df <- reactive({
     req(auc_preview())
     
     auc_preview() %>%
       mutate(
         receptor = factor(receptor),
-        treatment = factor(treatment),
-        group = interaction(receptor, treatment, sep = " | ", drop = TRUE)
+        treatment = factor(treatment)
       ) %>%
       filter(is.finite(auc))
   })
@@ -1212,36 +1109,85 @@ server <- function(input, output, session) {
     aov(auc ~ receptor * treatment, data = df)
   })
   
-  auc_tukey_df <- reactive({
+  auc_tukey_treatment_within_receptor_df <- reactive({
     df <- auc_stats_df()
     
-    validate(
-      need(nrow(df) > 0, "No AUC data available for Tukey post-hoc tests."),
-      need(n_distinct(df$group) >= 2, "Need at least 2 groups for AUC Tukey post-hoc tests.")
-    )
+    out <- split(df, df$receptor) |>
+      purrr::imap_dfr(function(d, rec_lab) {
+        if (n_distinct(d$treatment) < 2) return(NULL)
+        
+        fit <- try(aov(auc ~ treatment, data = d), silent = TRUE)
+        if (inherits(fit, "try-error")) return(NULL)
+        
+        tk <- try(TukeyHSD(fit, "treatment"), silent = TRUE)
+        if (inherits(tk, "try-error")) return(NULL)
+        
+        as.data.frame(tk$treatment) %>%
+          tibble::rownames_to_column("comparison") %>%
+          mutate(receptor = as.character(rec_lab), .before = 1)
+      })
     
-    fit <- aov(auc ~ group, data = df)
-    tk <- TukeyHSD(fit, "group")
-    
-    as.data.frame(tk$group) %>%
-      tibble::rownames_to_column("comparison")
+    if (nrow(out) == 0) {
+      tibble(
+        receptor = character(),
+        comparison = character(),
+        diff = numeric(),
+        lwr = numeric(),
+        upr = numeric(),
+        `p adj` = numeric()
+      )
+    } else {
+      out
+    }
   })
   
-  output$time_anova_out <- renderPrint({
-    summary(time_rm_fit())
+  auc_tukey_receptor_within_treatment_df <- reactive({
+    df <- auc_stats_df()
+    
+    out <- split(df, df$treatment) |>
+      purrr::imap_dfr(function(d, trt_lab) {
+        if (n_distinct(d$receptor) < 2) return(NULL)
+        
+        fit <- try(aov(auc ~ receptor, data = d), silent = TRUE)
+        if (inherits(fit, "try-error")) return(NULL)
+        
+        tk <- try(TukeyHSD(fit, "receptor"), silent = TRUE)
+        if (inherits(tk, "try-error")) return(NULL)
+        
+        as.data.frame(tk$receptor) %>%
+          tibble::rownames_to_column("comparison") %>%
+          mutate(treatment = as.character(trt_lab), .before = 1)
+      })
+    
+    if (nrow(out) == 0) {
+      tibble(
+        treatment = character(),
+        comparison = character(),
+        diff = numeric(),
+        lwr = numeric(),
+        upr = numeric(),
+        `p adj` = numeric()
+      )
+    } else {
+      out
+    }
   })
-  
-  output$time_tukey_out <- renderTable({
-    time_tukey_df()
-  }, striped = TRUE)
   
   output$auc_anova_out <- renderPrint({
     summary(auc_anova_fit())
   })
   
-  output$auc_tukey_out <- renderTable({
-    auc_tukey_df()
+  output$auc_tukey_treat_within_receptor <- renderTable({
+    auc_tukey_treatment_within_receptor_df()
   }, striped = TRUE)
+  
+  output$auc_tukey_receptor_within_treatment <- renderTable({
+    auc_tukey_receptor_within_treatment_df()
+  }, striped = TRUE)
+  
+  output$time_anova_out <- renderPrint({
+    summary(time_rm_fit())
+  })
   
   # ---------------------------
   # Downloads
@@ -1292,9 +1238,7 @@ server <- function(input, output, session) {
   )
   
   output$download_auc_plot_png <- downloadHandler(
-    filename = function() {
-      paste0("incucyte_auc_plot_", Sys.Date(), ".png")
-    },
+    filename = function() paste0("incucyte_auc_plot_", Sys.Date(), ".png"),
     content = function(file) {
       p <- auc_plot_obj()
       
@@ -1320,9 +1264,7 @@ server <- function(input, output, session) {
   )
   
   output$download_auc_plot_svg <- downloadHandler(
-    filename = function() {
-      paste0("incucyte_auc_plot_", Sys.Date(), ".svg")
-    },
+    filename = function() paste0("incucyte_auc_plot_", Sys.Date(), ".svg"),
     content = function(file) {
       p <- auc_plot_obj()
       
@@ -1343,6 +1285,36 @@ server <- function(input, output, session) {
         units = "mm",
         bg = "white"
       )
+    }
+  )
+  
+  output$download_stats_csv <- downloadHandler(
+    filename = function() paste0("incucyte_stats_", Sys.Date(), ".csv"),
+    content = function(file) {
+      auc_anova_tbl <- broom::tidy(auc_anova_fit()) %>%
+        mutate(table = "auc_anova", .before = 1)
+      
+      time_anova_tbl <- tryCatch({
+        broom::tidy(time_rm_fit()) %>%
+          mutate(table = "time_anova", .before = 1)
+      }, error = function(e) {
+        tibble(table = "time_anova", term = NA_character_, statistic = NA_real_, p.value = NA_real_)
+      })
+      
+      auc_treat_tbl <- auc_tukey_treatment_within_receptor_df() %>%
+        mutate(table = "auc_tukey_treatment_within_receptor", .before = 1)
+      
+      auc_receptor_tbl <- auc_tukey_receptor_within_treatment_df() %>%
+        mutate(table = "auc_tukey_receptor_within_treatment", .before = 1)
+      
+      all_tbl <- bind_rows(
+        suppressWarnings(auc_anova_tbl),
+        suppressWarnings(time_anova_tbl),
+        suppressWarnings(auc_treat_tbl),
+        suppressWarnings(auc_receptor_tbl)
+      )
+      
+      write_csv(all_tbl, file)
     }
   )
 }
