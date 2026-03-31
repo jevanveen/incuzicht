@@ -1,14 +1,42 @@
 # app.R
 # Incucyte Multi-File Import + Channel Normalization
+# Supports:
+#   1) Well-style headers with well IDs, e.g. "er pra E2 30 nm 0.5 ul (A1)"
+#   2) Comma-separated condition headers, e.g. "E2 30 nM,HEK293T + ERa (1) 50K / well"
+#
+# Features
+# - Auto-parses receptor + treatment from condition headers
+# - Treatment parser supports E2, P4, DHT, 4-OHT, DEX, CORT, RU-486
+# - Extracts well IDs where present
+# - Extracts replicate IDs where present in comma-style headers
+# - Optional plate map import; plate map overrides parsed receptor/treatment/passage for matched wells
+# - Plate map visual check with auto-detected plate size and matched/unmatched wells
+# - Matching across channels is based on parsed factors, not raw condition strings
+# - Factor editor uses rhandsontable in LONG format with sortable columns
+# - Passage is editable in the same factor editor table
+# - Receptor and treatment combinations are canonicalized
+# - Plot tab includes timecourse + AUC preview
+# - Prism export uses AUC values over the currently selected plot/filter window
+# - AUC plot can be exported as high-res PNG or SVG
+# - Statistics tab:
+#     * 2-way ANOVA on AUC data
+#     * Tukey post-hoc: treatments within each receptor
+#     * Tukey post-hoc: receptors within each treatment
+#     * 3-way repeated-measures ANOVA on time data
+# - Export all stats tables as CSV
 
 library(shiny)
 library(tidyverse)
 library(readr)
 library(stringr)
 library(rhandsontable)
+library(broom)
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
+# ---------------------------
+# Low-level helpers
+# ---------------------------
 find_data_header_row <- function(lines) {
   idx <- which(str_detect(lines, "^Date Time\\tElapsed\\b"))
   if (length(idx) == 0) return(NA_integer_)
@@ -63,6 +91,9 @@ read_incucyte_raw_table <- function(path) {
   dat
 }
 
+# ---------------------------
+# Canonicalization
+# ---------------------------
 canonicalize_receptor_combo <- function(x) {
   if (length(x) != 1) return("none")
   if (is.na(x) || x == "" || tolower(x) == "none") return("none")
@@ -115,7 +146,7 @@ canonicalize_treatment_combo <- function(x) {
   parts <- unique(parts)
   
   get_ligand <- function(s) {
-    m <- str_match(s, "\\b(E2|P4|DHT|4-OHT|DEX|CORT)\\b")
+    m <- str_match(s, "\\b(E2|P4|DHT|4-OHT|DEX|CORT|RU-486)\\b")
     lig <- m[, 2]
     ifelse(is.na(lig), "ZZZ", lig)
   }
@@ -126,7 +157,7 @@ canonicalize_treatment_combo <- function(x) {
     ifelse(is.na(dose), Inf, dose)
   }
   
-  ligand_order <- c("E2", "P4", "DHT", "4-OHT", "DEX", "CORT", "ZZZ")
+  ligand_order <- c("E2", "P4", "DHT", "4-OHT", "RU-486", "DEX", "CORT", "ZZZ")
   ord_lig <- match(get_ligand(parts), ligand_order)
   ord_dose <- get_dose(parts)
   
@@ -159,6 +190,9 @@ make_factor_key <- function(receptor, treatment) {
   paste(normalize_factor_key(receptor), normalize_factor_key(treatment), sep = " || ")
 }
 
+# ---------------------------
+# Parsing
+# ---------------------------
 clean_condition_header <- function(x) {
   x %>%
     str_to_lower() %>%
@@ -178,11 +212,7 @@ extract_receptors <- function(x) {
   
   if (str_detect(s, "\\berb\\b|\\ber b\\b|\\besr2\\b|\\ber2\\b")) recs <- c(recs, "ER_b")
   if (str_detect(s, "\\ber\\b|\\bera\\b|\\ber a\\b|\\besr1\\b|\\ber1\\b|\\bnoer\\b")) {
-    if (str_detect(s, "\\bnoer\\b")) {
-      recs <- c(recs, "NOER")
-    } else {
-      recs <- c(recs, "ER_a")
-    }
+    if (str_detect(s, "\\bnoer\\b")) recs <- c(recs, "NOER") else recs <- c(recs, "ER_a")
   }
   if (str_detect(s, "\\bpra\\b|\\bpr a\\b")) recs <- c(recs, "PR_a")
   if (str_detect(s, "\\bprb\\b|\\bpr b\\b")) recs <- c(recs, "PR_b")
@@ -199,9 +229,7 @@ extract_receptors <- function(x) {
   canonical <- canonicalize_receptor_combo(paste(canonical, collapse = " + "))
   canon_parts <- if (canonical == "none") character(0) else str_split(canonical, "\\s*\\+\\s*", simplify = FALSE)[[1]]
   
-  final_parts <- c(canon_parts, custom)
-  final_parts <- unique(final_parts)
-  
+  final_parts <- unique(c(canon_parts, custom))
   if (length(final_parts) == 0) "none" else paste(final_parts, collapse = " + ")
 }
 
@@ -214,7 +242,7 @@ extract_treatment <- function(x) {
   
   is_num <- function(z) str_detect(z, "^[0-9]+\\.?[0-9]*$")
   is_unit <- function(z) str_detect(z, regex("^(pm|nm|um|µm|mm)$", ignore_case = TRUE))
-  is_ligand <- function(z) str_detect(z, regex("^(e2|p4|dht|4-oht|dex|cort)$", ignore_case = TRUE))
+  is_ligand <- function(z) str_detect(z, regex("^(e2|p4|dht|4-oht|dex|cort|ru-486)$", ignore_case = TRUE))
   
   normalize_unit <- function(z) {
     z <- toupper(z)
@@ -261,7 +289,6 @@ extract_treatment <- function(x) {
   }
   
   hits <- unique(hits)
-  
   if (length(hits) > 0) return(canonicalize_treatment_combo(paste(hits, collapse = " + ")))
   if (veh_only) return("VEH")
   "VEH"
@@ -284,7 +311,7 @@ parse_comma_header <- function(header) {
   rhs <- if (length(parts) >= 2) paste(parts[-1], collapse = ",") else ""
   
   rep_id <- str_match(rhs, "\\((\\d+)\\)")[, 2]
-  receptor_token <- str_match(rhs, "\\+\\s*([A-Za-z0-9_]+)\\s*\\(")[, 2]
+  receptor_token <- str_match(rhs, "\\+\\s*([A-Za-z0-9_\\-]+)\\s*\\(")[, 2]
   
   receptor <- ifelse(
     is.na(receptor_token),
@@ -312,7 +339,6 @@ guess_receptor_treatment <- function(condition_vec) {
 
 read_incucyte_long <- function(path, drop_stderr = TRUE) {
   dat <- read_incucyte_raw_table(path)
-  
   if (drop_stderr) dat <- dat %>% select(-matches("Std Err"))
   
   cond_names <- names(dat)[-(1:2)]
@@ -349,7 +375,7 @@ read_incucyte_long <- function(path, drop_stderr = TRUE) {
     long %>%
       left_join(parsed, by = c("condition" = "condition_raw")) %>%
       mutate(
-        well_id = extract_well_id(condition),
+        well_id = toupper(extract_well_id(condition)),
         replicate_id = "",
         receptor = if_else(is.na(as.character(receptor)), "none", as.character(receptor)),
         treatment = if_else(is.na(as.character(treatment)), "VEH", as.character(treatment))
@@ -358,6 +384,85 @@ read_incucyte_long <- function(path, drop_stderr = TRUE) {
   }
 }
 
+# ---------------------------
+# Plate map helpers
+# ---------------------------
+read_plate_map <- function(path) {
+  pm <- read_csv(path, show_col_types = FALSE) %>% rename_with(tolower)
+  
+  required_cols <- c("well", "hormone", "receptor")
+  missing <- setdiff(required_cols, names(pm))
+  if (length(missing) > 0) {
+    stop("Plate map is missing required columns: ", paste(missing, collapse = ", "))
+  }
+  
+  pm %>%
+    mutate(
+      well = toupper(str_squish(as.character(well))),
+      hormone = as.character(hormone),
+      receptor = as.character(receptor),
+      passage = if ("passage" %in% names(.)) as.character(passage) else NA_character_,
+      expt = if ("expt" %in% names(.)) as.character(expt) else NA_character_,
+      cell_line = if ("cell_line" %in% names(.)) as.character(cell_line) else NA_character_,
+      receptor_pm = purrr::map_chr(receptor, canonicalize_receptor_edit),
+      treatment_pm = purrr::map_chr(hormone, canonicalize_treatment_edit),
+      passage_pm = dplyr::if_else(
+        is.na(passage) | str_squish(passage) == "",
+        NA_character_,
+        paste0("Passage_", passage)
+      )
+    ) %>%
+    select(well, cell_line, expt, receptor_pm, treatment_pm, passage_pm)
+}
+
+infer_plate_size <- function(wells) {
+  wells <- unique(na.omit(wells[wells != ""]))
+  if (length(wells) == 0) return(NA_character_)
+  
+  rows <- str_extract(wells, "^[A-Z]")
+  cols <- suppressWarnings(as.integer(str_extract(wells, "[0-9]+$")))
+  
+  n_rows <- length(unique(rows))
+  n_cols <- max(cols, na.rm = TRUE)
+  n_total <- n_rows * n_cols
+  
+  dplyr::case_when(
+    n_rows <= 2 && n_cols <= 3 ~ "6-well",
+    n_rows <= 3 && n_cols <= 4 ~ "12-well",
+    n_rows <= 4 && n_cols <= 6 ~ "24-well",
+    n_rows <= 6 && n_cols <= 8 ~ "48-well",
+    n_rows <= 8 && n_cols <= 12 ~ "96-well",
+    TRUE ~ paste0(n_total, "-well (inferred)")
+  )
+}
+
+make_plate_layout <- function(wells_present, wells_matched = NULL) {
+  wells_present <- unique(na.omit(wells_present[wells_present != ""]))
+  if (length(wells_present) == 0) return(tibble())
+  
+  rows <- sort(unique(str_extract(wells_present, "^[A-Z]")))
+  cols <- sort(unique(suppressWarnings(as.integer(str_extract(wells_present, "[0-9]+$")))))
+  
+  grid <- expand_grid(row = rows, col = cols) %>%
+    mutate(
+      well = paste0(row, col),
+      in_data = well %in% wells_present,
+      matched = if (is.null(wells_matched)) NA else well %in% wells_matched,
+      status = case_when(
+        !in_data ~ "empty",
+        is.na(matched) ~ "data only",
+        matched ~ "matched",
+        TRUE ~ "unmatched"
+      )
+    ) %>%
+    pivot_wider(names_from = col, values_from = status)
+  
+  grid
+}
+
+# ---------------------------
+# Plot/stats helpers
+# ---------------------------
 preview_file_lines <- function(path, n = 10) {
   lines <- readLines(path, warn = FALSE, n = n)
   tibble(line_no = seq_along(lines), line = lines)
@@ -379,7 +484,6 @@ ols_control_adjust <- function(df, sig_col, ctl_col) {
   
   adj <- rep(NA_real_, length(y))
   adj[ok] <- y[ok] - b * (x[ok] - xbar)
-  
   df$value_norm <- adj
   df
 }
@@ -397,11 +501,11 @@ auc_trapz <- function(x, y) {
 
 classify_treatment_group <- function(treatment) {
   trt <- toupper(as.character(treatment))
-  
   has_e2   <- str_detect(trt, "\\bE2\\b")
   has_p4   <- str_detect(trt, "\\bP4\\b")
   has_dht  <- str_detect(trt, "\\bDHT\\b")
   has_4oht <- str_detect(trt, "\\b4-OHT\\b")
+  has_ru   <- str_detect(trt, "\\bRU-486\\b")
   has_gc   <- str_detect(trt, "\\bDEX\\b|\\bCORT\\b|\\bGLUCO\\b")
   
   ligands <- c(
@@ -409,6 +513,7 @@ classify_treatment_group <- function(treatment) {
     if (has_p4) "P4",
     if (has_dht) "DHT",
     if (has_4oht) "4-OHT",
+    if (has_ru) "RU-486",
     if (has_gc) "Glucocorticoid"
   )
   
@@ -417,10 +522,9 @@ classify_treatment_group <- function(treatment) {
 }
 
 treatment_levels_master <- c(
-  "VEH","E2","P4","DHT","4-OHT","Glucocorticoid",
-  "E2 + P4","E2 + DHT","E2 + 4-OHT","P4 + DHT","P4 + 4-OHT","DHT + 4-OHT",
-  "E2 + P4 + DHT","E2 + P4 + 4-OHT","E2 + DHT + 4-OHT","P4 + DHT + 4-OHT",
-  "E2 + P4 + DHT + 4-OHT"
+  "VEH","E2","P4","DHT","4-OHT","RU-486","Glucocorticoid",
+  "E2 + P4","E2 + DHT","E2 + 4-OHT","E2 + RU-486","P4 + DHT","P4 + 4-OHT","P4 + RU-486",
+  "DHT + 4-OHT","DHT + RU-486","4-OHT + RU-486"
 )
 
 treatment_color_values <- c(
@@ -429,20 +533,23 @@ treatment_color_values <- c(
   "P4" = "#FD8008",
   "DHT" = "#0F80FF",
   "4-OHT" = "#7A3CFF",
+  "RU-486" = "#9E9E9E",
   "Glucocorticoid" = "#00A878",
   "E2 + P4" = "#C23B8E",
   "E2 + DHT" = "#8A4DFF",
   "E2 + 4-OHT" = "#B04DFF",
+  "E2 + RU-486" = "#B85A8A",
   "P4 + DHT" = "#7F9CFF",
   "P4 + 4-OHT" = "#C06A88",
+  "P4 + RU-486" = "#C08A60",
   "DHT + 4-OHT" = "#4F5BFF",
-  "E2 + P4 + DHT" = "#6E63CA",
-  "E2 + P4 + 4-OHT" = "#A04D9E",
-  "E2 + DHT + 4-OHT" = "#6A4DFF",
-  "P4 + DHT + 4-OHT" = "#5C7AAA",
-  "E2 + P4 + DHT + 4-OHT" = "#7A5A8A"
+  "DHT + RU-486" = "#6B8BB8",
+  "4-OHT + RU-486" = "#8E6BA8"
 )
 
+# ---------------------------
+# UI
+# ---------------------------
 ui <- fluidPage(
   titlePanel("Incucyte Multi-File Import + Channel Normalization"),
   sidebarLayout(
@@ -452,6 +559,12 @@ ui <- fluidPage(
         "Upload Incucyte export files (.txt/.tsv/.csv)",
         multiple = TRUE,
         accept = c(".txt", ".tsv", ".csv")
+      ),
+      fileInput(
+        "platemap",
+        "Upload plate map (.csv)",
+        multiple = FALSE,
+        accept = c(".csv")
       ),
       checkboxInput("drop_stderr", "Drop '(Std Err ...)' columns", value = TRUE),
       uiOutput("channel_map_ui"),
@@ -514,6 +627,8 @@ ui <- fluidPage(
           tags$p("Edit passage, receptor, and treatment. Columns are sortable. The table supports copy/paste and drag-fill. Click 'Apply edits' when done."),
           rHandsontableOutput("editor_table", height = "560px")
         ),
+        tabPanel("Plate map", tableOutput("preview_platemap")),
+        tabPanel("Plate check", verbatimTextOutput("plate_check_summary"), tableOutput("plate_check_layout")),
         tabPanel("Join checks", verbatimTextOutput("join_checks")),
         tabPanel("File preview", tableOutput("preview_files")),
         tabPanel("Normalized", tableOutput("preview_norm")),
@@ -523,6 +638,9 @@ ui <- fluidPage(
   )
 )
 
+# ---------------------------
+# Server
+# ---------------------------
 server <- function(input, output, session) {
   
   output$channel_map_ui <- renderUI({
@@ -576,6 +694,16 @@ server <- function(input, output, session) {
       })
     )
   })
+  
+  plate_map_tbl <- reactive({
+    req(input$platemap)
+    read_plate_map(input$platemap$datapath)
+  })
+  
+  output$preview_platemap <- renderTable({
+    req(input$platemap)
+    plate_map_tbl()
+  }, striped = TRUE)
   
   output$preview_files <- renderTable({
     req(input$files)
@@ -632,10 +760,11 @@ server <- function(input, output, session) {
         "Passage_NA"
       }
       
-      dat0 %>%
+      dat0 <- dat0 %>%
         mutate(
           file = file,
           channel = channel,
+          well_id = toupper(str_squish(well_id)),
           passage = if_else(
             replicate_id != "",
             paste0(default_passage, "_rep", replicate_id),
@@ -647,7 +776,22 @@ server <- function(input, output, session) {
           analysis    = meta$analysis[[1]] %||% NA_character_,
           condition_id = paste(file, condition, sep = " || "),
           receptor = purrr::map_chr(receptor, canonicalize_receptor_combo),
-          treatment = purrr::map_chr(treatment, canonicalize_treatment_combo),
+          treatment = purrr::map_chr(treatment, canonicalize_treatment_combo)
+        )
+      
+      if (!is.null(input$platemap)) {
+        dat0 <- dat0 %>%
+          left_join(plate_map_tbl(), by = c("well_id" = "well")) %>%
+          mutate(
+            receptor = coalesce(receptor_pm, receptor),
+            treatment = coalesce(treatment_pm, treatment),
+            passage = coalesce(passage_pm, passage)
+          ) %>%
+          select(-cell_line, -expt, -receptor_pm, -treatment_pm, -passage_pm)
+      }
+      
+      dat0 %>%
+        mutate(
           factor_key = make_factor_key(receptor, treatment)
         ) %>%
         select(
@@ -657,6 +801,46 @@ server <- function(input, output, session) {
         )
     })
   }, ignoreInit = TRUE)
+  
+  output$plate_check_summary <- renderPrint({
+    req(raw_long_auto())
+    wells_in_data <- raw_long_auto() %>% pull(well_id) %>% unique()
+    plate_size_data <- infer_plate_size(wells_in_data)
+    
+    if (is.null(input$platemap)) {
+      cat("Detected data plate size:", plate_size_data, "\n")
+      cat("No plate map uploaded.")
+    } else {
+      pm <- plate_map_tbl()
+      wells_pm <- pm$well
+      plate_size_pm <- infer_plate_size(wells_pm)
+      
+      matched <- intersect(wells_in_data[wells_in_data != ""], wells_pm)
+      unmatched_data <- setdiff(wells_in_data[wells_in_data != ""], wells_pm)
+      unmatched_pm <- setdiff(wells_pm, wells_in_data[wells_in_data != ""])
+      
+      cat("Detected data plate size:", plate_size_data, "\n")
+      cat("Detected plate map size:", plate_size_pm, "\n")
+      cat("Matched wells:", length(matched), "\n")
+      cat("Unmatched data wells:", length(unmatched_data), "\n")
+      cat("Unmatched plate map wells:", length(unmatched_pm), "\n")
+      if (length(unmatched_data) > 0) cat("Data-only wells:", paste(sort(unmatched_data), collapse = ", "), "\n")
+      if (length(unmatched_pm) > 0) cat("Plate-map-only wells:", paste(sort(unmatched_pm), collapse = ", "), "\n")
+    }
+  })
+  
+  output$plate_check_layout <- renderTable({
+    req(raw_long_auto())
+    wells_in_data <- raw_long_auto() %>% pull(well_id) %>% unique()
+    
+    if (is.null(input$platemap)) {
+      make_plate_layout(wells_in_data)
+    } else {
+      wells_pm <- plate_map_tbl()$well
+      matched <- intersect(wells_in_data[wells_in_data != ""], wells_pm)
+      make_plate_layout(union(wells_in_data, wells_pm), matched)
+    }
+  }, striped = TRUE)
   
   editor_default <- reactive({
     req(raw_long_auto())
@@ -996,7 +1180,6 @@ server <- function(input, output, session) {
   auc_plot_obj <- reactive({
     req(auc_preview())
     df <- auc_preview()
-    
     if (nrow(df) == 0 || all(!is.finite(df$auc))) return(NULL)
     
     df <- df %>%
@@ -1115,10 +1298,8 @@ server <- function(input, output, session) {
     out <- split(df, df$receptor) |>
       purrr::imap_dfr(function(d, rec_lab) {
         if (n_distinct(d$treatment) < 2) return(NULL)
-        
         fit <- try(aov(auc ~ treatment, data = d), silent = TRUE)
         if (inherits(fit, "try-error")) return(NULL)
-        
         tk <- try(TukeyHSD(fit, "treatment"), silent = TRUE)
         if (inherits(tk, "try-error")) return(NULL)
         
@@ -1136,9 +1317,7 @@ server <- function(input, output, session) {
         upr = numeric(),
         `p adj` = numeric()
       )
-    } else {
-      out
-    }
+    } else out
   })
   
   auc_tukey_receptor_within_treatment_df <- reactive({
@@ -1147,10 +1326,8 @@ server <- function(input, output, session) {
     out <- split(df, df$treatment) |>
       purrr::imap_dfr(function(d, trt_lab) {
         if (n_distinct(d$receptor) < 2) return(NULL)
-        
         fit <- try(aov(auc ~ receptor, data = d), silent = TRUE)
         if (inherits(fit, "try-error")) return(NULL)
-        
         tk <- try(TukeyHSD(fit, "receptor"), silent = TRUE)
         if (inherits(tk, "try-error")) return(NULL)
         
@@ -1168,9 +1345,7 @@ server <- function(input, output, session) {
         upr = numeric(),
         `p adj` = numeric()
       )
-    } else {
-      out
-    }
+    } else out
   })
   
   output$auc_anova_out <- renderPrint({
@@ -1194,25 +1369,17 @@ server <- function(input, output, session) {
   # ---------------------------
   output$download_editor <- downloadHandler(
     filename = function() paste0("incucyte_editor_table_", Sys.Date(), ".csv"),
-    content = function(file) {
-      req(current_editor_map())
-      write_csv(current_editor_map(), file)
-    }
+    content = function(file) write_csv(current_editor_map(), file)
   )
   
   output$download_norm <- downloadHandler(
     filename = function() paste0("incucyte_normalized_by_passage_", Sys.Date(), ".csv"),
-    content = function(file) {
-      req(normalized_passage())
-      write_csv(normalized_passage(), file)
-    }
+    content = function(file) write_csv(normalized_passage(), file)
   )
   
   output$download_prism <- downloadHandler(
     filename = function() paste0("incucyte_prism_auc_", Sys.Date(), ".csv"),
     content = function(file) {
-      req(prism_wide())
-      
       wide <- prism_wide()
       value_cols <- names(wide)[-1]
       
@@ -1241,7 +1408,6 @@ server <- function(input, output, session) {
     filename = function() paste0("incucyte_auc_plot_", Sys.Date(), ".png"),
     content = function(file) {
       p <- auc_plot_obj()
-      
       if (is.null(p)) {
         png(file, width = 1800, height = 1200, res = 300)
         plot.new()
@@ -1267,7 +1433,6 @@ server <- function(input, output, session) {
     filename = function() paste0("incucyte_auc_plot_", Sys.Date(), ".svg"),
     content = function(file) {
       p <- auc_plot_obj()
-      
       if (is.null(p)) {
         svg(filename = file, width = 3.5, height = 2.75, bg = "white")
         plot.new()
