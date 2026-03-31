@@ -550,6 +550,17 @@ treatment_color_values <- c(
   "4-OHT + RU-486" = "#8E6BA8"
 )
 
+compute_auc_export_dims <- function(df) {
+  n_receptors <- dplyr::n_distinct(df$receptor)
+  n_treatments <- dplyr::n_distinct(df$treatment_group)
+  
+  width_mm <- 70 + 12 * n_receptors + 6 * n_treatments
+  width_mm <- max(89, min(width_mm, 240))
+  height_mm <- 70
+  
+  list(width_mm = width_mm, height_mm = height_mm)
+}
+
 # ---------------------------
 # UI
 # ---------------------------
@@ -625,7 +636,6 @@ ui <- fluidPage(
         ),
         tabPanel("Plate map", tableOutput("preview_platemap")),
         tabPanel("Plate check", verbatimTextOutput("plate_check_summary"), tableOutput("plate_check_layout")),
-        tabPanel("Join checks", verbatimTextOutput("join_checks")),
         tabPanel("File preview", tableOutput("preview_files")),
         tabPanel("Normalized", tableOutput("preview_norm")),
         tabPanel("Prism preview", tableOutput("preview_prism"))
@@ -854,7 +864,7 @@ server <- function(input, output, session) {
     df <- editor_rv() %>%
       select(exclude, file, well_id, replicate_id, condition, n_reps, passage, receptor, treatment)
     
-    rhandsontable(df, rowHeaders = NULL, stretchH = "all", height = 540) %>%
+    rhandsontable(df, rowHeaders = NULL, stretchH = "all", height = 540, selectCallback = TRUE) %>%
       hot_col("exclude", type = "checkbox") %>%
       hot_col("file", readOnly = TRUE) %>%
       hot_col("well_id", readOnly = TRUE) %>%
@@ -975,35 +985,6 @@ server <- function(input, output, session) {
       ) %>%
       filter(!exclude) %>%
       relocate(exclude, well_id, replicate_id, passage, receptor, treatment, factor_key, .after = condition)
-  })
-  
-  output$join_checks <- renderPrint({
-    req(raw_long())
-    rl <- raw_long()
-    
-    list(
-      files_loaded = rl %>%
-        distinct(file, channel, passage, vessel_name, metric, cell_type, analysis) %>%
-        arrange(passage, channel, file),
-      per_channel_summary = rl %>%
-        group_by(channel) %>%
-        summarize(
-          n_rows = n(),
-          n_passages = n_distinct(passage),
-          n_factor_keys = n_distinct(factor_key),
-          n_times = n_distinct(elapsed),
-          .groups = "drop"
-        ),
-      factor_assignment_summary = rl %>%
-        distinct(condition_id, condition, well_id, replicate_id, passage, receptor, treatment, factor_key) %>%
-        summarize(
-          n_rows = n(),
-          n_unique_factor_keys = n_distinct(factor_key),
-          receptor_levels = paste(sort(unique(as.character(receptor))), collapse = ", "),
-          treatment_levels = paste(sort(unique(as.character(treatment))), collapse = ", "),
-          passage_levels = paste(sort(unique(as.character(passage))), collapse = ", ")
-        )
-    )
   })
   
   wide_joined_passage <- reactive({
@@ -1407,12 +1388,16 @@ server <- function(input, output, session) {
         return()
       }
       
+      df <- auc_preview() %>%
+        mutate(treatment_group = purrr::map_chr(treatment, classify_treatment_group))
+      dims <- compute_auc_export_dims(df)
+      
       ggsave(
         filename = file,
         plot = p,
         device = "png",
-        width = 89,
-        height = 70,
+        width = dims$width_mm,
+        height = dims$height_mm,
         units = "mm",
         dpi = 600,
         bg = "white"
@@ -1432,12 +1417,16 @@ server <- function(input, output, session) {
         return()
       }
       
+      df <- auc_preview() %>%
+        mutate(treatment_group = purrr::map_chr(treatment, classify_treatment_group))
+      dims <- compute_auc_export_dims(df)
+      
       ggsave(
         filename = file,
         plot = p,
         device = "svg",
-        width = 89,
-        height = 70,
+        width = dims$width_mm,
+        height = dims$height_mm,
         units = "mm",
         bg = "white"
       )
