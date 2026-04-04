@@ -412,27 +412,43 @@ infer_plate_size <- function(wells) {
   )
 }
 
-make_plate_layout <- function(wells_present, wells_matched = NULL) {
-  wells_present <- unique(na.omit(wells_present[wells_present != ""]))
-  if (length(wells_present) == 0) return(tibble())
-  
-  rows <- sort(unique(str_extract(wells_present, "^[A-Z]")))
-  cols <- sort(unique(suppressWarnings(as.integer(str_extract(wells_present, "[0-9]+$")))))
-  
-  expand_grid(row = rows, col = cols) %>%
+make_plate_preview_tables <- function(df) {
+  df <- df %>%
     mutate(
-      well = paste0(row, col),
-      in_data = well %in% wells_present,
-      matched = if (is.null(wells_matched)) NA else well %in% wells_matched,
-      status = case_when(
-        !in_data ~ "empty",
-        is.na(matched) ~ "data only",
-        matched ~ "matched",
-        TRUE ~ "unmatched"
+      well_id = toupper(str_squish(as.character(well_id))),
+      plate_id = as.character(passage),
+      label = if_else(
+        well_id == "" | is.na(well_id),
+        NA_character_,
+        paste0(
+          as.character(receptor), "\n",
+          as.character(treatment), "\n",
+          as.character(passage)
+        )
       )
     ) %>%
-    select(-in_data, -matched, -well) %>%
-    pivot_wider(names_from = col, values_from = status)
+    filter(!is.na(well_id), well_id != "") %>%
+    distinct(plate_id, well_id, label)
+  
+  if (nrow(df) == 0) return(list())
+  
+  split(df, df$plate_id) |>
+    purrr::imap(function(d, plate_name) {
+      rows <- sort(unique(str_extract(d$well_id, "^[A-Z]")))
+      cols <- sort(unique(suppressWarnings(as.integer(str_extract(d$well_id, "[0-9]+$")))))
+      
+      grid <- expand_grid(row = rows, col = cols) %>%
+        mutate(well_id = paste0(row, col)) %>%
+        left_join(d %>% select(well_id, label), by = "well_id") %>%
+        mutate(label = replace_na(label, "")) %>%
+        select(-well_id) %>%
+        pivot_wider(names_from = col, values_from = label)
+      
+      list(
+        plate_id = plate_name,
+        table = grid
+      )
+    })
 }
 
 # ---------------------------
@@ -644,12 +660,10 @@ ui <- fluidPage(
           h4("Plate compatibility summary"),
           verbatimTextOutput("plate_check_summary"),
           br(),
-          h4("Plate layout check"),
-          tableOutput("plate_check_layout")
+          h4("Plate layout previews"),
+          uiOutput("plate_check_layout")
         ),
-        tabPanel("File preview", tableOutput("preview_files")),
-        tabPanel("Normalized", tableOutput("preview_norm")),
-        tabPanel("Prism preview", tableOutput("preview_prism"))
+        tabPanel("File preview", tableOutput("preview_files"))
       )
     )
   )
@@ -823,19 +837,6 @@ server <- function(input, output, session) {
     }
   })
   
-  output$plate_check_layout <- renderTable({
-    req(raw_long_auto())
-    wells_in_data <- raw_long_auto() %>% pull(well_id) %>% unique()
-    
-    if (is.null(input$platemap)) {
-      make_plate_layout(wells_in_data)
-    } else {
-      wells_pm <- plate_map_tbl()$well
-      matched <- intersect(wells_in_data[wells_in_data != ""], wells_pm)
-      make_plate_layout(union(wells_in_data, wells_pm), matched)
-    }
-  }, striped = TRUE)
-  
   editor_default <- reactive({
     req(raw_long_auto())
     
@@ -978,6 +979,43 @@ server <- function(input, output, session) {
     }
   })
   
+  output$plate_check_layout <- renderUI({
+    req(current_editor_map())
+    
+    plate_tables <- make_plate_preview_tables(current_editor_map())
+    
+    if (length(plate_tables) == 0) {
+      return(tags$p("No well-based plate layout available."))
+    }
+    
+    tagList(
+      purrr::map(plate_tables, function(x) {
+        tagList(
+          tags$h4(paste("Plate:", x$plate_id)),
+          tableOutput(outputId = paste0("plate_layout_", make.names(x$plate_id))),
+          tags$br()
+        )
+      })
+    )
+  })
+  
+  observe({
+    req(current_editor_map())
+    plate_tables <- make_plate_preview_tables(current_editor_map())
+    
+    purrr::walk(plate_tables, function(x) {
+      local({
+        plate_name <- x$plate_id
+        plate_tbl <- x$table
+        output_id <- paste0("plate_layout_", make.names(plate_name))
+        
+        output[[output_id]] <- renderTable({
+          plate_tbl
+        }, striped = TRUE, bordered = TRUE, spacing = "xs")
+      })
+    })
+  })
+  
   raw_long <- reactive({
     req(raw_long_auto(), current_editor_map())
     
@@ -1065,11 +1103,6 @@ server <- function(input, output, session) {
     out
   })
   
-  output$preview_norm <- renderTable({
-    req(normalized_passage())
-    head(normalized_passage(), 20)
-  }, striped = TRUE)
-  
   stats_long <- reactive({
     req(normalized_passage())
     normalized_passage() %>%
@@ -1130,36 +1163,6 @@ server <- function(input, output, session) {
       group_by(receptor, treatment, passage) %>%
       summarize(auc = auc_trapz(elapsed, value_norm), .groups = "drop")
   })
-  
-  prism_wide <- reactive({
-    req(auc_preview())
-    auc_df <- auc_preview() %>% arrange(receptor, treatment, passage)
-    
-    auc_df <- auc_df %>%
-      group_by(receptor, treatment) %>%
-      mutate(rep_idx = row_number()) %>%
-      ungroup()
-    
-    col_template <- auc_df %>%
-      count(treatment, name = "n_rep") %>%
-      group_by(treatment) %>%
-      summarise(max_rep = max(n_rep), .groups = "drop") %>%
-      mutate(col_keys = purrr::map2(treatment, max_rep, ~ paste0(.x, "__rep", seq_len(.y)))) %>%
-      pull(col_keys) %>%
-      unlist()
-    
-    wide <- auc_df %>%
-      mutate(col_key = paste0(treatment, "__rep", rep_idx)) %>%
-      select(receptor, col_key, auc) %>%
-      pivot_wider(names_from = col_key, values_from = auc)
-    
-    wide %>% select(receptor, any_of(col_template))
-  })
-  
-  output$preview_prism <- renderTable({
-    req(prism_wide())
-    prism_wide()
-  }, striped = TRUE)
   
   output$plot <- renderPlot({
     req(filtered_stats_long())
@@ -1367,9 +1370,28 @@ server <- function(input, output, session) {
   output$download_prism <- downloadHandler(
     filename = function() paste0("incucyte_prism_auc_", Sys.Date(), ".csv"),
     content = function(file) {
-      wide <- prism_wide()
-      value_cols <- names(wide)[-1]
+      auc_df <- auc_preview() %>% arrange(receptor, treatment, passage)
       
+      auc_df <- auc_df %>%
+        group_by(receptor, treatment) %>%
+        mutate(rep_idx = row_number()) %>%
+        ungroup()
+      
+      col_template <- auc_df %>%
+        count(treatment, name = "n_rep") %>%
+        group_by(treatment) %>%
+        summarise(max_rep = max(n_rep), .groups = "drop") %>%
+        mutate(col_keys = purrr::map2(treatment, max_rep, ~ paste0(.x, "__rep", seq_len(.y)))) %>%
+        pull(col_keys) %>%
+        unlist()
+      
+      wide <- auc_df %>%
+        mutate(col_key = paste0(treatment, "__rep", rep_idx)) %>%
+        select(receptor, col_key, auc) %>%
+        pivot_wider(names_from = col_key, values_from = auc) %>%
+        select(receptor, any_of(col_template))
+      
+      value_cols <- names(wide)[-1]
       treatment_header <- c("", str_replace(value_cols, "__rep\\d+$", ""))
       rep_header <- c("receptor", str_extract(value_cols, "rep\\d+$"))
       
