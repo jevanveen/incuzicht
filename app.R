@@ -7,6 +7,7 @@ library(readr)
 library(stringr)
 library(rhandsontable)
 library(broom)
+library(DT)
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
@@ -209,6 +210,8 @@ extract_receptors <- function(x) {
   if (length(final_parts) == 0) "none" else paste(final_parts, collapse = " + ")
 }
 
+# Recognizes known ligands first, but if none are found, preserves the cleaned condition
+# as a factor-like treatment label rather than collapsing to VEH.
 extract_treatment <- function(x) {
   s <- clean_condition_header(x)
   veh_only <- str_detect(s, "\\bveh\\b|\\bvehicle\\b|\\be2oh\\b|\\bethanol\\b|\\bdmso\\b")
@@ -267,7 +270,21 @@ extract_treatment <- function(x) {
   hits <- unique(hits)
   if (length(hits) > 0) return(canonicalize_treatment_combo(paste(hits, collapse = " + ")))
   if (veh_only) return("VEH")
-  "VEH"
+  
+  # Preserve unfamiliar conditions as factor labels
+  # Remove obvious receptor terms so treatment remains treatment-like
+  s2 <- s %>%
+    str_replace_all("\\b(era|er a|erb|er b|er|esr1|esr2|pra|pr a|prb|pr b|pgr|pr|ar|gr|mr|androgen receptor|glucocorticoid receptor|mineralocorticoid receptor)\\b", " ") %>%
+    str_replace_all("\\s*\\+\\s*", " + ") %>%
+    str_replace_all("\\s+", " ") %>%
+    str_trim()
+  
+  s2 <- str_replace_all(s2, "\\bnone\\b", "")
+  s2 <- str_replace_all(s2, "\\s+", " ")
+  s2 <- str_trim(s2)
+  
+  if (s2 == "" || s2 == "+") return("VEH")
+  toupper(s2)
 }
 
 parse_comma_header <- function(header) {
@@ -482,9 +499,16 @@ mask_spikes_cooks <- function(df, value_col = "value_norm", x_col = "elapsed") {
 # ---------------------------
 # Plot/stat helpers
 # ---------------------------
-preview_file_lines <- function(path, n = 10) {
-  lines <- readLines(path, warn = FALSE, n = n)
-  tibble(line_no = seq_along(lines), line = lines)
+preview_tabular_file <- function(path, n = 20) {
+  lines <- readLines(path, warn = FALSE)
+  header_i <- find_data_header_row(lines)
+  if (is.na(header_i)) {
+    dat <- read_delim(path, delim = "\t", show_col_types = FALSE, n_max = n)
+  } else {
+    txt <- paste(lines[header_i:length(lines)], collapse = "\n")
+    dat <- read_delim(I(txt), delim = "\t", show_col_types = FALSE, n_max = n)
+  }
+  dat
 }
 
 ols_control_adjust <- function(df, sig_col, ctl_col) {
@@ -536,7 +560,7 @@ classify_treatment_group <- function(treatment) {
     if (has_gc) "Glucocorticoid"
   )
   
-  if (length(ligands) == 0) return("VEH")
+  if (length(ligands) == 0) return(as.character(treatment))
   paste(ligands, collapse = " + ")
 }
 
@@ -663,7 +687,11 @@ ui <- fluidPage(
           h4("Plate layout previews"),
           uiOutput("plate_check_layout")
         ),
-        tabPanel("File preview", tableOutput("preview_files"))
+        tabPanel(
+          "File preview",
+          br(),
+          DTOutput("preview_files_dt")
+        )
       )
     )
   )
@@ -727,14 +755,15 @@ server <- function(input, output, session) {
     plate_map_tbl()
   }, striped = TRUE)
   
-  output$preview_files <- renderTable({
+  output$preview_files_dt <- renderDT({
     req(input$files)
-    tibble(file = input$files$name, path = input$files$datapath) %>%
-      mutate(preview = purrr::map(path, preview_file_lines, n = 10)) %>%
-      select(file, preview) %>%
-      tidyr::unnest(preview) %>%
-      select(file, line_no, line)
-  }, striped = TRUE)
+    previews <- purrr::imap(input$files$datapath, function(path, i) {
+      dat <- preview_tabular_file(path, n = 20)
+      dat <- dat %>% mutate(`..file` = input$files$name[i], .before = 1)
+      dat
+    })
+    bind_rows(previews)
+  }, options = list(pageLength = 20, scrollX = TRUE))
   
   output$norm_ui <- renderUI({
     req(channel_map())
@@ -757,7 +786,7 @@ server <- function(input, output, session) {
         selected = "ratio"
       ),
       checkboxInput("baseline_norm", "Also baseline-normalize within Passage+Factor combination", value = FALSE),
-      checkboxInput("mask_spikes", "Mask spikes (Cook's distance > 4/n)", value = TRUE)
+      checkboxInput("mask_spikes", "Mask spikes (Cook's distance > 4/n)", value = FALSE)
     )
   })
   
@@ -1029,7 +1058,7 @@ server <- function(input, output, session) {
         exclude = if_else(is.na(exclude), FALSE, as.logical(exclude)),
         passage = factor(as.character(passage)),
         receptor = factor(purrr::map_chr(as.character(receptor), canonicalize_receptor_combo)),
-        treatment = factor(purrr::map_chr(as.character(treatment), canonicalize_treatment_combo)),
+        treatment = factor(as.character(treatment)),
         factor_key = make_factor_key(receptor, treatment)
       ) %>%
       filter(!exclude) %>%
@@ -1116,15 +1145,16 @@ server <- function(input, output, session) {
     if (nrow(df) == 0) return(NULL)
     
     rng <- range(df$elapsed, na.rm = TRUE)
-    step_val <- max((rng[2] - rng[1]) / 100, .Machine$double.eps)
+    minv <- floor(rng[1])
+    maxv <- ceiling(rng[2])
     
     sliderInput(
       "plot_time_range",
       "Elapsed time range",
-      min = floor(rng[1]),
-      max = ceiling(rng[2]),
-      value = c(floor(rng[1]), ceiling(rng[2])),
-      step = step_val
+      min = minv,
+      max = maxv,
+      value = c(minv, maxv),
+      step = 1
     )
   })
   
