@@ -210,8 +210,6 @@ extract_receptors <- function(x) {
   if (length(final_parts) == 0) "none" else paste(final_parts, collapse = " + ")
 }
 
-# Recognizes known ligands first, but if none are found, preserves the cleaned condition
-# as a factor-like treatment label rather than collapsing to VEH.
 extract_treatment <- function(x) {
   s <- clean_condition_header(x)
   veh_only <- str_detect(s, "\\bveh\\b|\\bvehicle\\b|\\be2oh\\b|\\bethanol\\b|\\bdmso\\b")
@@ -271,8 +269,6 @@ extract_treatment <- function(x) {
   if (length(hits) > 0) return(canonicalize_treatment_combo(paste(hits, collapse = " + ")))
   if (veh_only) return("VEH")
   
-  # Preserve unfamiliar conditions as factor labels
-  # Remove obvious receptor terms so treatment remains treatment-like
   s2 <- s %>%
     str_replace_all("\\b(era|er a|erb|er b|er|esr1|esr2|pra|pr a|prb|pr b|pgr|pr|ar|gr|mr|androgen receptor|glucocorticoid receptor|mineralocorticoid receptor)\\b", " ") %>%
     str_replace_all("\\s*\\+\\s*", " + ") %>%
@@ -609,6 +605,8 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       fileInput("files", "Upload Incucyte export files (.txt/.tsv/.csv)", multiple = TRUE, accept = c(".txt", ".tsv", ".csv")),
+      actionButton("clear_files", "Clear uploaded files", class = "btn-warning"),
+      br(), br(),
       checkboxInput("drop_stderr", "Drop '(Std Err ...)' columns", value = TRUE),
       uiOutput("channel_map_ui"),
       hr(),
@@ -702,13 +700,38 @@ ui <- fluidPage(
 # ---------------------------
 server <- function(input, output, session) {
   
-  output$channel_map_ui <- renderUI({
+  uploaded_files_rv <- reactiveVal(NULL)
+  
+  observeEvent(input$files, {
     req(input$files)
-    fns <- input$files$name
+    
+    new_files <- tibble(
+      file = input$files$name,
+      path = input$files$datapath
+    )
+    
+    old_files <- uploaded_files_rv()
+    
+    if (is.null(old_files)) {
+      uploaded_files_rv(new_files)
+    } else {
+      combined <- bind_rows(old_files, new_files) %>%
+        distinct(file, path, .keep_all = TRUE)
+      uploaded_files_rv(combined)
+    }
+  })
+  
+  observeEvent(input$clear_files, {
+    uploaded_files_rv(NULL)
+  })
+  
+  output$channel_map_ui <- renderUI({
+    req(uploaded_files_rv())
+    fns <- uploaded_files_rv()$file
     
     tagList(
       h4("Assign a fluorescence channel to each file"),
-      tags$p(tags$small("Default: if filename contains 'red' anywhere → NIR.")),
+      tags$p(tags$small("You can upload files in batches; files are retained until cleared or the app reloads.")),
       lapply(seq_along(fns), function(i) {
         fname <- fns[i]
         default <- if (str_detect(tolower(fname), "red")) "NIR" else
@@ -726,13 +749,16 @@ server <- function(input, output, session) {
   })
   
   channel_map <- reactive({
-    req(input$files)
+    req(uploaded_files_rv())
+    files_df <- uploaded_files_rv()
+    
     tibble(
-      file = input$files$name,
-      path = input$files$datapath,
-      channel = purrr::map_chr(seq_along(input$files$name), function(i) {
-        fname <- input$files$name[i]
+      file = files_df$file,
+      path = files_df$path,
+      channel = purrr::map_chr(seq_len(nrow(files_df)), function(i) {
+        fname <- files_df$file[i]
         val <- input[[paste0("chan_", i)]]
+        
         if (is.null(val) || is.na(val) || val == "") {
           if (str_detect(tolower(fname), "red")) return("NIR")
           if (str_detect(tolower(fname), "nir")) return("NIR")
@@ -756,10 +782,10 @@ server <- function(input, output, session) {
   }, striped = TRUE)
   
   output$preview_files_dt <- renderDT({
-    req(input$files)
-    previews <- purrr::imap(input$files$datapath, function(path, i) {
+    req(uploaded_files_rv())
+    previews <- purrr::imap(uploaded_files_rv()$path, function(path, i) {
       dat <- preview_tabular_file(path, n = 20)
-      dat <- dat %>% mutate(`..file` = input$files$name[i], .before = 1)
+      dat <- dat %>% mutate(`..file` = uploaded_files_rv()$file[i], .before = 1)
       dat
     })
     bind_rows(previews)
