@@ -1467,21 +1467,31 @@ server <- function(input, output, session) {
   )
   
   output$download_timecourse <- downloadHandler(
-    
     filename = function() paste0("incucyte_timecourse_", Sys.Date(), ".csv"),
-    
     content = function(file) {
       
       req(filtered_stats_long())
       
-      filtered_stats_long() %>%
-        
-        arrange(receptor, treatment, passage, elapsed) %>%
-        
-        write_csv(file)
+      df <- filtered_stats_long() %>%
+        mutate(
+          cell_line = as.factor(cell_type %||% "unknown"),
+          hormone   = factor(as.character(treatment), ordered = TRUE),
+          receptor  = factor(as.character(receptor)),
+          expt      = factor(str_extract(as.character(file), "[0-9]+") %||% "1"),
+          passage   = factor(str_replace(as.character(passage), "Passage_", "p")),
+          elapsed_hour = elapsed,
+          id = factor(paste0(expt, "_", passage))
+        ) %>%
+        group_by(cell_line, hormone, receptor, expt, passage, elapsed_hour, id) %>%
+        summarise(
+          mean_count   = mean(value_norm, na.rm = TRUE),
+          median_count = median(value_norm, na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        arrange(cell_line, hormone, receptor, expt, passage, elapsed_hour)
       
+      write_csv(df, file)
     }
-    
   )
   
   output$download_auc_plot_png <- downloadHandler(
