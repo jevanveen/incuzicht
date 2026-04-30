@@ -614,10 +614,11 @@ ui <- fluidPage(
       actionButton("run", "Import + Process", class = "btn-primary"),
       hr(),
       h4("Downloads"),
-      downloadButton("download_editor", "Editor table (csv)"),
-      downloadButton("download_norm", "Normalized by Passage (csv)"),
       downloadButton("download_prism", "Prism AUC export (csv)"),
-      downloadButton("download_stats_csv", "Export all stats CSV")
+      downloadButton("download_timecourse", "Timecourse data (csv)"),
+      downloadButton("download_stats_csv", "Export all stats CSV"),
+      downloadButton("download_editor", "Editor table (csv)"),
+      downloadButton("download_norm", "Normalized by Passage (csv)")
     ),
     mainPanel(
       tabsetPanel(
@@ -1463,6 +1464,24 @@ server <- function(input, output, session) {
         na = ""
       )
     }
+  )
+  
+  output$download_timecourse <- downloadHandler(
+    
+    filename = function() paste0("incucyte_timecourse_", Sys.Date(), ".csv"),
+    
+    content = function(file) {
+      
+      req(filtered_stats_long())
+      
+      filtered_stats_long() %>%
+        
+        arrange(receptor, treatment, passage, elapsed) %>%
+        
+        write_csv(file)
+      
+    }
+    
   )
   
   output$download_auc_plot_png <- downloadHandler(
