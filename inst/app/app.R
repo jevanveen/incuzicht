@@ -1,6 +1,6 @@
 # app.R
 # Incucyte Multi-File Import + Channel Normalization
-# HITL factor-map editor, plate map preview, plotting, AUC, exports
+# HITL factor-map editor, buffered edits, plate map preview, plotting, AUC, exports
 
 library(shiny)
 library(tidyverse)
@@ -231,7 +231,6 @@ extract_receptors <- function(x) {
   if (str_detect(s, "\\bmr\\b|\\bmineralocorticoid receptor\\b|\\bnr3c2\\b")) recs <- c(recs, "MR")
   
   if (length(recs) == 0) return("none")
-  
   canonicalize_receptor_one(paste(recs, collapse = " + "))
 }
 
@@ -393,8 +392,7 @@ propagate_editor_mappings <- function(tbl) {
     }
   }
   
-  tbl %>%
-    select(-receptor_changed, -treatment_changed, -passage_changed)
+  tbl %>% select(-receptor_changed, -treatment_changed, -passage_changed)
 }
 
 # ---------------------------
@@ -657,6 +655,7 @@ ui <- fluidPage(
     mainPanel(
       tabsetPanel(
         id = "main_tabs",
+        
         tabPanel(
           "Plate map",
           br(),
@@ -682,7 +681,7 @@ ui <- fluidPage(
           br(),
           tags$p(
             tags$strong("How it works: "),
-            "Edit receptor, treatment, or passage. The app preserves exactly what you type and propagates edits to every group with the same original guess."
+            "Edit receptor, treatment, or passage. Return commits the cell into a lightweight buffer. Apply edits propagates changes and updates downstream data."
           ),
           fluidRow(
             column(4, actionButton("reset_editor", "Reset all edits")),
@@ -730,9 +729,7 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   
   plot_tab_active <- reactive({
-    
     identical(input$main_tabs, "Plot")
-    
   })
   
   uploaded_files_rv <- reactiveVal(NULL)
@@ -943,16 +940,19 @@ server <- function(input, output, session) {
   })
   
   editor_rv <- reactiveVal(NULL)
+  editor_buffer_rv <- reactiveVal(NULL)
   applied_editor_rv <- reactiveVal(NULL)
   
   observeEvent(hitl_default(), {
     editor_rv(hitl_default())
+    editor_buffer_rv(hitl_default())
     applied_editor_rv(NULL)
   })
   
   observeEvent(input$reset_editor, {
     req(hitl_default())
     editor_rv(hitl_default())
+    editor_buffer_rv(hitl_default())
     applied_editor_rv(NULL)
   })
   
@@ -976,23 +976,16 @@ server <- function(input, output, session) {
       hot_table(highlightCol = TRUE, highlightRow = TRUE, columnSorting = TRUE, manualColumnMove = TRUE)
   })
   
-  read_editor_table <- reactive({
+  observeEvent(input$editor_table, {
     req(editor_rv())
     
-    if (is.null(input$editor_table)) {
-      return(editor_rv())
-    }
-    
     tbl_visible <- tryCatch(hot_to_r(input$editor_table), error = function(e) NULL)
-    
-    if (is.null(tbl_visible)) {
-      return(editor_rv())
-    }
+    if (is.null(tbl_visible)) return()
     
     key_map <- editor_rv() %>%
       select(original_guess, guess_key, receptor_guess, treatment_guess, passage_guess)
     
-    as_tibble(tbl_visible) %>%
+    tbl <- as_tibble(tbl_visible) %>%
       mutate(
         across(c(original_guess, example_labels, receptor, treatment, passage), as.character),
         n_matching_wells = as.integer(n_matching_wells),
@@ -1004,12 +997,14 @@ server <- function(input, output, session) {
       mutate(
         factor_key = make_factor_key(receptor, treatment)
       )
+    
+    editor_buffer_rv(tbl)
   })
   
   observeEvent(input$apply_editor, {
-    req(editor_rv())
+    req(editor_buffer_rv())
     
-    df <- read_editor_table() %>%
+    df <- editor_buffer_rv() %>%
       propagate_editor_mappings() %>%
       mutate(
         receptor = clean_user_factor(receptor),
@@ -1019,6 +1014,8 @@ server <- function(input, output, session) {
       )
     
     applied_editor_rv(df)
+    editor_rv(df)
+    editor_buffer_rv(df)
   }, ignoreInit = TRUE)
   
   current_editor_map <- reactive({
@@ -1027,7 +1024,6 @@ server <- function(input, output, session) {
     df <- if (!is.null(applied_editor_rv())) applied_editor_rv() else editor_rv()
     
     df %>%
-      propagate_editor_mappings() %>%
       mutate(
         receptor = clean_user_factor(receptor),
         treatment = clean_user_factor(treatment),
@@ -1379,6 +1375,7 @@ server <- function(input, output, session) {
   
   output$auc_plot <- renderPlot({
     req(plot_tab_active())
+    
     p <- auc_plot_obj()
     
     if (is.null(p)) {
@@ -1471,12 +1468,14 @@ server <- function(input, output, session) {
   output$download_auc_plot_png <- downloadHandler(
     filename = function() paste0("incucyte_auc_plot_", Sys.Date(), ".png"),
     content = function(file) {
-      p <- auc_plot_obj()
+      p <- isolate({
+        if (isTRUE(plot_tab_active())) auc_plot_obj() else NULL
+      })
       
       if (is.null(p)) {
         png(file, width = 1800, height = 1200, res = 300)
         plot.new()
-        text(0.5, 0.5, "No AUC values.")
+        text(0.5, 0.5, "Open the Plot tab first to render the AUC plot.")
         dev.off()
         return()
       }
@@ -1502,12 +1501,14 @@ server <- function(input, output, session) {
   output$download_auc_plot_svg <- downloadHandler(
     filename = function() paste0("incucyte_auc_plot_", Sys.Date(), ".svg"),
     content = function(file) {
-      p <- auc_plot_obj()
+      p <- isolate({
+        if (isTRUE(plot_tab_active())) auc_plot_obj() else NULL
+      })
       
       if (is.null(p)) {
         svg(filename = file, width = 3.5, height = 2.75, bg = "white")
         plot.new()
-        text(0.5, 0.5, "No AUC values.")
+        text(0.5, 0.5, "Open the Plot tab first to render the AUC plot.")
         dev.off()
         return()
       }
