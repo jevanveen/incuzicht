@@ -456,13 +456,17 @@ make_plate_preview_tables <- function(df) {
         well_id == "" | is.na(well_id),
         NA_character_,
         paste0(
-          "<div style='line-height:1.35'>",
+          "<div style='line-height:1.35; padding:4px; background-color:",
+          if_else(n_matching_wells > 1, "#FFB81C", "transparent"),
+          "'>",
           "<div><strong>Well:</strong> ", well_id, "</div>",
           "<div><strong>Receptor:</strong> ", as.character(receptor), "</div>",
           "<div><strong>Treatment:</strong> ", as.character(treatment), "</div>",
           "<div><strong>Passage:</strong> ", as.character(passage), "</div>",
+          "<div><strong>Matching wells:</strong> ", n_matching_wells, "</div>",
           "</div>"
         )
+      )
       )
     ) %>%
     filter(!is.na(well_id), well_id != "") %>%
@@ -648,8 +652,6 @@ ui <- fluidPage(
       h4("Downloads"),
       downloadButton("download_prism", "Prism AUC export (csv)"),
       downloadButton("download_timecourse", "Timecourse data (csv)"),
-      downloadButton("download_editor", "Editor table (csv)"),
-      downloadButton("download_norm", "Normalized by Passage (csv)")
     ),
     
     mainPanel(
@@ -1083,7 +1085,10 @@ server <- function(input, output, session) {
     
     plate_tables <- make_plate_preview_tables(
       annotated_conditions() %>%
-        distinct(well_id, passage, receptor, treatment)
+        group_by(passage, receptor, treatment) %>%
+        mutate(n_matching_wells = n_distinct(well_id[well_id != ""])) %>%
+        ungroup() %>%
+        distinct(well_id, passage, receptor, treatment, n_matching_wells)
     )
     
     if (length(plate_tables) == 0) return(tags$p("No well-based layout available."))
@@ -1387,15 +1392,6 @@ server <- function(input, output, session) {
     p
   })
   
-  output$download_editor <- downloadHandler(
-    filename = function() paste0("incucyte_editor_table_", Sys.Date(), ".csv"),
-    content = function(file) write_csv(current_editor_map(), file)
-  )
-  
-  output$download_norm <- downloadHandler(
-    filename = function() paste0("incucyte_normalized_by_passage_", Sys.Date(), ".csv"),
-    content = function(file) write_csv(normalized_passage(), file)
-  )
   
   output$download_prism <- downloadHandler(
     filename = function() paste0("incucyte_prism_auc_", Sys.Date(), ".csv"),
