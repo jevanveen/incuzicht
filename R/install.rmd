@@ -1,0 +1,38 @@
+# Overview
+
+incuzicht is a Shiny app for importing, normalizing, visualizing, and analyzing Incucyte timecourse data.
+
+It supports:
+
+-   multi-file Incucyte imports
+-   batch uploads
+-   automatic factor parsing
+-   manual factor editing
+-   plate map import
+-   normalization
+-   AUC plotting
+-   statistics
+-   CSV exports
+
+------------------------------------------------------------------------
+
+# Installation
+
+## 1. Install R and RStudio
+
+Install:
+
+-   R
+-   RStudio
+
+R version 4.1 or newer is recommended.
+
+------------------------------------------------------------------------
+
+## 2. Install required packages
+
+Run this once in R:
+```{r}
+install.packages(c( "shiny", "tidyverse", "readr", "stringr", "rhandsontable", "broom", "DT", "remotes", "devtools"))
+devtools::install_github(jevanveen/incuzicht)
+```
