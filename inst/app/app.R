@@ -656,6 +656,7 @@ ui <- fluidPage(
     
     mainPanel(
       tabsetPanel(
+        id = "main_tabs",
         tabPanel(
           "Plate map",
           br(),
@@ -727,6 +728,12 @@ ui <- fluidPage(
 # Server
 # ---------------------------
 server <- function(input, output, session) {
+  
+  plot_tab_active <- reactive({
+    
+    identical(input$main_tabs, "Plot")
+    
+  })
   
   uploaded_files_rv <- reactiveVal(NULL)
   
@@ -1203,6 +1210,7 @@ server <- function(input, output, session) {
   })
   
   output$plot_time_ui <- renderUI({
+    req(plot_tab_active())
     req(stats_long())
     
     df <- stats_long() %>% filter(is.finite(elapsed))
@@ -1221,6 +1229,7 @@ server <- function(input, output, session) {
   })
   
   output$plot_receptor_ui <- renderUI({
+    req(plot_tab_active())
     req(stats_long())
     
     levs <- stats_long() %>%
@@ -1233,6 +1242,7 @@ server <- function(input, output, session) {
   })
   
   output$plot_treatment_ui <- renderUI({
+    req(plot_tab_active())
     req(stats_long())
     
     levs <- stats_long() %>%
@@ -1274,6 +1284,7 @@ server <- function(input, output, session) {
   })
   
   output$plot <- renderPlot({
+    req(plot_tab_active())
     req(filtered_stats_long())
     
     df <- filtered_stats_long()
@@ -1312,6 +1323,7 @@ server <- function(input, output, session) {
   })
   
   auc_plot_obj <- reactive({
+    req(plot_tab_active())
     req(auc_preview())
     
     df <- auc_preview()
@@ -1362,6 +1374,7 @@ server <- function(input, output, session) {
   })
   
   output$auc_plot <- renderPlot({
+    req(plot_tab_active())
     p <- auc_plot_obj()
     
     if (is.null(p)) {
