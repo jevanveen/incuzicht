@@ -994,13 +994,13 @@ server <- function(input, output, session) {
         passage = purrr::map_chr(passage, standardize_passage_label)
       ) %>%
       left_join(key_map, by = "original_guess") %>%
-      propagate_editor_mappings() %>%
       mutate(
         factor_key = make_factor_key(receptor, treatment)
       )
     
     editor_rv(tbl)
   })
+  
   
   observeEvent(input$apply_editor, {
     req(editor_rv())
