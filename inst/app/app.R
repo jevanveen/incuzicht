@@ -1082,13 +1082,13 @@ server <- function(input, output, session) {
   output$plate_check_layout <- renderUI({
     req(annotated_conditions())
     
-    plate_tables <- make_plate_preview_tables(
-      annotated_conditions() %>%
-        group_by(passage, receptor, treatment) %>%
-        mutate(n_matching_wells = n_distinct(well_id[well_id != ""])) %>%
-        ungroup() %>%
-        distinct(well_id, passage, receptor, treatment, n_matching_wells)
-    )
+    plate_layout_df <- annotated_conditions() %>%
+      group_by(passage, receptor, treatment) %>%
+      mutate(n_matching_wells = n_distinct(well_id[well_id != ""])) %>%
+      ungroup() %>%
+      distinct(well_id, passage, receptor, treatment, n_matching_wells)
+    
+    plate_tables <- make_plate_preview_tables(plate_layout_df)
     
     if (length(plate_tables) == 0) return(tags$p("No well-based layout available."))
     
@@ -1106,10 +1106,13 @@ server <- function(input, output, session) {
   observe({
     req(annotated_conditions())
     
-    plate_tables <- make_plate_preview_tables(
-      annotated_conditions() %>%
-        distinct(well_id, passage, receptor, treatment)
-    )
+    plate_layout_df <- annotated_conditions() %>%
+      group_by(passage, receptor, treatment) %>%
+      mutate(n_matching_wells = n_distinct(well_id[well_id != ""])) %>%
+      ungroup() %>%
+      distinct(well_id, passage, receptor, treatment, n_matching_wells)
+    
+    plate_tables <- make_plate_preview_tables(plate_layout_df)
     
     purrr::walk(plate_tables, function(x) {
       local({
