@@ -44,6 +44,10 @@ standardize_passage_label <- function(x) {
   z
 }
 
+clean_user_factor <- function(x) {
+  str_squish(as.character(x))
+}
+
 read_incucyte_file <- function(path, drop_stderr = TRUE) {
   lines <- readLines(path, warn = FALSE)
   header_i <- find_data_header_row(lines)
@@ -84,7 +88,7 @@ read_incucyte_file <- function(path, drop_stderr = TRUE) {
 }
 
 # ---------------------------
-# Canonicalization
+# Canonicalization for initial guesses only
 # ---------------------------
 canonicalize_receptor_one <- function(x) {
   if (length(x) != 1) stop("canonicalize_receptor_one expects scalar input")
@@ -163,8 +167,6 @@ canonicalize_treatment_one <- function(x) {
 
 canonicalize_treatment_combo <- Vectorize(canonicalize_treatment_one, USE.NAMES = FALSE)
 
-canonicalize_passage_edit <- function(x) standardize_passage_label(x)
-
 normalize_factor_key <- function(x) {
   x %>%
     as.character() %>%
@@ -230,19 +232,7 @@ extract_receptors <- function(x) {
   
   if (length(recs) == 0) return("none")
   
-  canonical <- recs[recs %in% c("ER_a", "ER_b", "PR", "PR_a", "PR_b", "AR", "GR", "MR")]
-  canonical <- canonicalize_receptor_one(paste(canonical, collapse = " + "))
-  
-  canon_parts <- if (canonical == "none") {
-    character(0)
-  } else {
-    str_split(canonical, "\\s*\\+\\s*", simplify = FALSE)[[1]]
-  }
-  
-  custom <- setdiff(unique(recs), c("ER_a", "ER_b", "PR", "PR_a", "PR_b", "AR", "GR", "MR"))
-  final_parts <- unique(c(canon_parts, custom))
-  
-  if (length(final_parts) == 0) "none" else paste(final_parts, collapse = " + ")
+  canonicalize_receptor_one(paste(recs, collapse = " + "))
 }
 
 extract_treatment <- function(x) {
@@ -341,7 +331,7 @@ add_factor_guesses <- function(df) {
       
       receptor_guess = canonicalize_receptor_combo(receptor_guess),
       treatment_guess = canonicalize_treatment_combo(treatment_guess),
-      passage_guess = purrr::map_chr(passage_guess, canonicalize_passage_edit),
+      passage_guess = purrr::map_chr(passage_guess, standardize_passage_label),
       
       guess_key = make_guess_key(receptor_guess, treatment_guess, passage_guess)
     )
@@ -352,12 +342,15 @@ parse_conditions_hitl <- function(raw_tbl) {
     distinct(condition_id, file, well_id, condition, receptor_guess, treatment_guess, passage_guess, guess_key) %>%
     group_by(guess_key, receptor_guess, treatment_guess, passage_guess) %>%
     summarise(
-      n_wells = n_distinct(well_id[well_id != ""]),
-      examples = paste(head(unique(condition), 3), collapse = " | "),
+      n_matching_wells = n_distinct(well_id[well_id != ""]),
+      example_labels = paste(head(unique(condition), 3), collapse = " | "),
       receptor = first(receptor_guess),
       treatment = first(treatment_guess),
       passage = first(passage_guess),
       .groups = "drop"
+    ) %>%
+    mutate(
+      original_guess = paste(receptor_guess, treatment_guess, passage_guess, sep = " | ")
     ) %>%
     arrange(receptor_guess, treatment_guess, passage_guess)
 }
@@ -365,9 +358,9 @@ parse_conditions_hitl <- function(raw_tbl) {
 propagate_editor_mappings <- function(tbl) {
   tbl <- tbl %>%
     mutate(
-      receptor_changed = receptor != receptor_guess,
-      treatment_changed = treatment != treatment_guess,
-      passage_changed = passage != passage_guess
+      receptor_changed = clean_user_factor(receptor) != clean_user_factor(receptor_guess),
+      treatment_changed = clean_user_factor(treatment) != clean_user_factor(treatment_guess),
+      passage_changed = clean_user_factor(passage) != clean_user_factor(passage_guess)
     )
   
   receptor_map <- tbl %>%
@@ -429,7 +422,7 @@ read_plate_map <- function(path) {
       passage_pm   = if_else(
         is.na(passage) | str_squish(passage) == "",
         NA_character_,
-        purrr::map_chr(passage, canonicalize_passage_edit)
+        purrr::map_chr(passage, standardize_passage_label)
       )
     ) %>%
     select(well, cell_line, expt, receptor_pm, treatment_pm, passage_pm)
@@ -633,6 +626,7 @@ compute_auc_export_dims <- function(df) {
 # ---------------------------
 ui <- fluidPage(
   titlePanel("Incucyte Multi-File Import + Channel Normalization"),
+  
   sidebarLayout(
     sidebarPanel(
       fileInput(
@@ -643,11 +637,15 @@ ui <- fluidPage(
       ),
       actionButton("clear_files", "Clear uploaded files", class = "btn-warning"),
       br(), br(),
+      
       checkboxInput("drop_stderr", "Drop '(Std Err ...)' columns", value = TRUE),
       uiOutput("channel_map_ui"),
+      
       hr(),
       uiOutput("norm_ui"),
+      
       actionButton("run", "Import + Process", class = "btn-primary"),
+      
       hr(),
       h4("Downloads"),
       downloadButton("download_prism", "Prism AUC export (csv)"),
@@ -683,7 +681,7 @@ ui <- fluidPage(
           br(),
           tags$p(
             tags$strong("How it works: "),
-            "Edit any receptor, treatment, or passage mapping once. The app propagates that edit to every group with the same original guess."
+            "Edit receptor, treatment, or passage. The app preserves exactly what you type and propagates edits to every group with the same original guess."
           ),
           fluidRow(
             column(4, actionButton("reset_editor", "Reset all edits")),
@@ -956,42 +954,43 @@ server <- function(input, output, session) {
     
     df <- editor_rv() %>%
       select(
-        receptor_guess, treatment_guess, passage_guess,
-        n_wells, examples,
-        receptor, treatment, passage
+        original_guess,
+        n_matching_wells,
+        example_labels,
+        receptor,
+        treatment,
+        passage
       )
     
     rhandsontable(df, rowHeaders = NULL, stretchH = "all", height = 540) %>%
-      hot_col("receptor_guess", readOnly = TRUE) %>%
-      hot_col("treatment_guess", readOnly = TRUE) %>%
-      hot_col("passage_guess", readOnly = TRUE) %>%
-      hot_col("n_wells", readOnly = TRUE) %>%
-      hot_col("examples", readOnly = TRUE) %>%
+      hot_col("original_guess", readOnly = TRUE) %>%
+      hot_col("n_matching_wells", readOnly = TRUE) %>%
+      hot_col("example_labels", readOnly = TRUE) %>%
       hot_table(highlightCol = TRUE, highlightRow = TRUE, columnSorting = TRUE, manualColumnMove = TRUE)
   })
   
   observeEvent(input$editor_table, {
     req(editor_rv())
     
-    tbl <- tryCatch(hot_to_r(input$editor_table), error = function(e) NULL)
-    if (is.null(tbl)) return()
+    tbl_visible <- tryCatch(hot_to_r(input$editor_table), error = function(e) NULL)
+    if (is.null(tbl_visible)) return()
     
-    tbl <- as_tibble(tbl) %>%
+    key_map <- editor_rv() %>%
+      select(original_guess, guess_key, receptor_guess, treatment_guess, passage_guess)
+    
+    tbl <- as_tibble(tbl_visible) %>%
       mutate(
-        across(
-          c(receptor_guess, treatment_guess, passage_guess, examples, receptor, treatment, passage),
-          as.character
-        ),
-        n_wells = as.integer(n_wells),
-        receptor_guess = canonicalize_receptor_combo(receptor_guess),
-        treatment_guess = canonicalize_treatment_combo(treatment_guess),
-        passage_guess = purrr::map_chr(passage_guess, canonicalize_passage_edit),
-        receptor = canonicalize_receptor_combo(receptor),
-        treatment = canonicalize_treatment_combo(treatment),
-        passage = purrr::map_chr(passage, canonicalize_passage_edit),
-        guess_key = make_guess_key(receptor_guess, treatment_guess, passage_guess)
+        across(c(original_guess, example_labels, receptor, treatment, passage), as.character),
+        n_matching_wells = as.integer(n_matching_wells),
+        receptor = clean_user_factor(receptor),
+        treatment = clean_user_factor(treatment),
+        passage = purrr::map_chr(passage, standardize_passage_label)
       ) %>%
-      propagate_editor_mappings()
+      left_join(key_map, by = "original_guess") %>%
+      propagate_editor_mappings() %>%
+      mutate(
+        factor_key = make_factor_key(receptor, treatment)
+      )
     
     editor_rv(tbl)
   })
@@ -1002,18 +1001,10 @@ server <- function(input, output, session) {
     df <- editor_rv() %>%
       propagate_editor_mappings() %>%
       mutate(
-        receptor_guess = canonicalize_receptor_combo(receptor_guess),
-        treatment_guess = canonicalize_treatment_combo(treatment_guess),
-        passage_guess = purrr::map_chr(passage_guess, canonicalize_passage_edit),
-        receptor = canonicalize_receptor_combo(receptor),
-        treatment = canonicalize_treatment_combo(treatment),
-        passage = purrr::map_chr(passage, canonicalize_passage_edit),
-        guess_key = make_guess_key(receptor_guess, treatment_guess, passage_guess),
+        receptor = clean_user_factor(receptor),
+        treatment = clean_user_factor(treatment),
+        passage = purrr::map_chr(passage, standardize_passage_label),
         factor_key = make_factor_key(receptor, treatment)
-      ) %>%
-      select(
-        guess_key, receptor_guess, treatment_guess, passage_guess,
-        n_wells, examples, receptor, treatment, passage, factor_key
       )
     
     applied_editor_rv(df)
@@ -1027,13 +1018,9 @@ server <- function(input, output, session) {
     df %>%
       propagate_editor_mappings() %>%
       mutate(
-        receptor_guess = canonicalize_receptor_combo(receptor_guess),
-        treatment_guess = canonicalize_treatment_combo(treatment_guess),
-        passage_guess = purrr::map_chr(passage_guess, canonicalize_passage_edit),
-        receptor = canonicalize_receptor_combo(receptor),
-        treatment = canonicalize_treatment_combo(treatment),
-        passage = purrr::map_chr(passage, canonicalize_passage_edit),
-        guess_key = make_guess_key(receptor_guess, treatment_guess, passage_guess),
+        receptor = clean_user_factor(receptor),
+        treatment = clean_user_factor(treatment),
+        passage = purrr::map_chr(passage, standardize_passage_label),
         factor_key = make_factor_key(receptor, treatment)
       )
   })
@@ -1077,9 +1064,9 @@ server <- function(input, output, session) {
     parsed_raw %>%
       left_join(em, by = "guess_key", suffix = c("_raw", "")) %>%
       mutate(
-        passage = factor(as.character(passage)),
-        receptor = factor(canonicalize_receptor_combo(as.character(receptor))),
-        treatment = factor(as.character(treatment)),
+        passage = factor(clean_user_factor(passage)),
+        receptor = factor(clean_user_factor(receptor)),
+        treatment = factor(clean_user_factor(treatment)),
         factor_key = make_factor_key(receptor, treatment)
       )
   })
