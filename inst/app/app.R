@@ -467,7 +467,6 @@ make_plate_preview_tables <- function(df) {
           "</div>"
         )
       )
-      )
     ) %>%
     filter(!is.na(well_id), well_id != "") %>%
     distinct(plate_id, well_id, label)
