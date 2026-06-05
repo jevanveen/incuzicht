@@ -35,6 +35,15 @@ extract_well_id <- function(x) {
   out
 }
 
+standardize_passage_label <- function(x) {
+  z <- str_trim(as.character(x))
+  if (length(z) != 1 || is.na(z) || z == "") return("Passage_NA")
+  if (str_detect(z, regex("^Passage_", ignore_case = TRUE))) return(z)
+  if (str_detect(z, regex("^p[0-9]+$", ignore_case = TRUE))) return(paste0("Passage_", str_extract(z, "[0-9]+")))
+  if (str_detect(z, "^[0-9]+$")) return(paste0("Passage_", z))
+  z
+}
+
 read_incucyte_file <- function(path, drop_stderr = TRUE) {
   lines <- readLines(path, warn = FALSE)
   header_i <- find_data_header_row(lines)
@@ -63,9 +72,7 @@ read_incucyte_file <- function(path, drop_stderr = TRUE) {
     col_types = cols(.default = col_character())
   )
   
-  if (ncol(dat) < 3) {
-    stop("Parsed <3 columns. Is this the right Incucyte export format?")
-  }
+  if (ncol(dat) < 3) stop("Parsed <3 columns. Is this the right Incucyte export format?")
   
   names(dat)[1:2] <- c("datetime", "elapsed")
   
@@ -156,10 +163,7 @@ canonicalize_treatment_one <- function(x) {
 
 canonicalize_treatment_combo <- Vectorize(canonicalize_treatment_one, USE.NAMES = FALSE)
 
-canonicalize_passage_edit <- function(x) {
-  z <- str_trim(as.character(x))
-  if (is.na(z) || z == "") "Passage_NA" else z
-}
+canonicalize_passage_edit <- function(x) standardize_passage_label(x)
 
 normalize_factor_key <- function(x) {
   x %>%
@@ -171,6 +175,15 @@ normalize_factor_key <- function(x) {
 
 make_factor_key <- function(receptor, treatment) {
   paste(normalize_factor_key(receptor), normalize_factor_key(treatment), sep = " || ")
+}
+
+make_guess_key <- function(receptor_guess, treatment_guess, passage_guess) {
+  paste(
+    normalize_factor_key(receptor_guess),
+    normalize_factor_key(treatment_guess),
+    normalize_factor_key(passage_guess),
+    sep = " || "
+  )
 }
 
 # ---------------------------
@@ -193,9 +206,7 @@ extract_receptors <- function(x) {
   s <- clean_condition_header(x)
   recs <- c()
   
-  if (str_detect(s, "\\berb\\b|\\ber b\\b|\\besr2\\b|\\ber2\\b")) {
-    recs <- c(recs, "ER_b")
-  }
+  if (str_detect(s, "\\berb\\b|\\ber b\\b|\\besr2\\b|\\ber2\\b")) recs <- c(recs, "ER_b")
   
   if (str_detect(s, "\\bera\\b|\\ber a\\b|\\besr1\\b|\\ber1\\b")) {
     recs <- c(recs, "ER_a")
@@ -316,19 +327,29 @@ extract_passage_from_condition <- function(x) {
   NA_character_
 }
 
-# ---------------------------
-# HITL group-level factor mapping
-# ---------------------------
-parse_conditions_hitl <- function(raw_tbl) {
-  raw_tbl %>%
-    distinct(condition_id, file, well_id, condition) %>%
+add_factor_guesses <- function(df) {
+  df %>%
     mutate(
-      receptor_guess  = purrr::map_chr(condition, extract_receptors),
-      treatment_guess = purrr::map_chr(condition, extract_treatment),
-      passage_guess   = purrr::map_chr(condition, extract_passage_from_condition),
-      passage_guess   = if_else(is.na(passage_guess), "Passage_NA", passage_guess),
-      guess_key       = make_factor_key(paste(receptor_guess, passage_guess), treatment_guess)
-    ) %>%
+      receptor_guess_parsed  = purrr::map_chr(condition, extract_receptors),
+      treatment_guess_parsed = purrr::map_chr(condition, extract_treatment),
+      passage_guess_parsed   = purrr::map_chr(condition, extract_passage_from_condition),
+      passage_guess_parsed   = if_else(is.na(passage_guess_parsed), passage, passage_guess_parsed),
+      
+      receptor_guess = coalesce(receptor_pm, receptor_guess_parsed),
+      treatment_guess = coalesce(treatment_pm, treatment_guess_parsed),
+      passage_guess = coalesce(passage_pm, passage_guess_parsed),
+      
+      receptor_guess = canonicalize_receptor_combo(receptor_guess),
+      treatment_guess = canonicalize_treatment_combo(treatment_guess),
+      passage_guess = purrr::map_chr(passage_guess, canonicalize_passage_edit),
+      
+      guess_key = make_guess_key(receptor_guess, treatment_guess, passage_guess)
+    )
+}
+
+parse_conditions_hitl <- function(raw_tbl) {
+  add_factor_guesses(raw_tbl) %>%
+    distinct(condition_id, file, well_id, condition, receptor_guess, treatment_guess, passage_guess, guess_key) %>%
     group_by(guess_key, receptor_guess, treatment_guess, passage_guess) %>%
     summarise(
       n_wells = n_distinct(well_id[well_id != ""]),
@@ -339,6 +360,48 @@ parse_conditions_hitl <- function(raw_tbl) {
       .groups = "drop"
     ) %>%
     arrange(receptor_guess, treatment_guess, passage_guess)
+}
+
+propagate_editor_mappings <- function(tbl) {
+  tbl <- tbl %>%
+    mutate(
+      receptor_changed = receptor != receptor_guess,
+      treatment_changed = treatment != treatment_guess,
+      passage_changed = passage != passage_guess
+    )
+  
+  receptor_map <- tbl %>%
+    filter(receptor_changed) %>%
+    distinct(receptor_guess, receptor)
+  
+  treatment_map <- tbl %>%
+    filter(treatment_changed) %>%
+    distinct(treatment_guess, treatment)
+  
+  passage_map <- tbl %>%
+    filter(passage_changed) %>%
+    distinct(passage_guess, passage)
+  
+  if (nrow(receptor_map) > 0) {
+    for (i in seq_len(nrow(receptor_map))) {
+      tbl$receptor[tbl$receptor_guess == receptor_map$receptor_guess[i]] <- receptor_map$receptor[i]
+    }
+  }
+  
+  if (nrow(treatment_map) > 0) {
+    for (i in seq_len(nrow(treatment_map))) {
+      tbl$treatment[tbl$treatment_guess == treatment_map$treatment_guess[i]] <- treatment_map$treatment[i]
+    }
+  }
+  
+  if (nrow(passage_map) > 0) {
+    for (i in seq_len(nrow(passage_map))) {
+      tbl$passage[tbl$passage_guess == passage_map$passage_guess[i]] <- passage_map$passage[i]
+    }
+  }
+  
+  tbl %>%
+    select(-receptor_changed, -treatment_changed, -passage_changed)
 }
 
 # ---------------------------
@@ -366,7 +429,7 @@ read_plate_map <- function(path) {
       passage_pm   = if_else(
         is.na(passage) | str_squish(passage) == "",
         NA_character_,
-        paste0("Passage_", passage)
+        purrr::map_chr(passage, canonicalize_passage_edit)
       )
     ) %>%
     select(well, cell_line, expt, receptor_pm, treatment_pm, passage_pm)
@@ -402,10 +465,12 @@ make_plate_preview_tables <- function(df) {
         well_id == "" | is.na(well_id),
         NA_character_,
         paste0(
-          "Well: ", well_id, "\n",
-          "Receptor: ", as.character(receptor), "\n",
-          "Treatment: ", as.character(treatment), "\n",
-          "Passage: ", as.character(passage)
+          "<div style='line-height:1.35'>",
+          "<div><strong>Well:</strong> ", well_id, "</div>",
+          "<div><strong>Receptor:</strong> ", as.character(receptor), "</div>",
+          "<div><strong>Treatment:</strong> ", as.character(treatment), "</div>",
+          "<div><strong>Passage:</strong> ", as.character(passage), "</div>",
+          "</div>"
         )
       )
     ) %>%
@@ -431,7 +496,7 @@ make_plate_preview_tables <- function(df) {
 }
 
 # ---------------------------
-# Spike masking and normalization
+# Math helpers
 # ---------------------------
 mask_spikes_cooks <- function(df, value_col = "value_norm", x_col = "elapsed") {
   y <- df[[value_col]]
@@ -478,6 +543,20 @@ ols_control_adjust <- function(df, sig_col, ctl_col) {
   df
 }
 
+auc_trapz <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  x <- x[ok]
+  y <- y[ok]
+  
+  if (length(x) < 2) return(NA_real_)
+  
+  ord <- order(x)
+  x <- x[ord]
+  y <- y[ord]
+  
+  sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
 # ---------------------------
 # Plot/export helpers
 # ---------------------------
@@ -492,20 +571,6 @@ preview_tabular_file <- function(path, n = 20) {
   }
   
   read_delim(I(txt), delim = "\t", show_col_types = FALSE, n_max = n)
-}
-
-auc_trapz <- function(x, y) {
-  ok <- is.finite(x) & is.finite(y)
-  x <- x[ok]
-  y <- y[ok]
-  
-  if (length(x) < 2) return(NA_real_)
-  
-  ord <- order(x)
-  x <- x[ord]
-  y <- y[ord]
-  
-  sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
 }
 
 classify_treatment_group <- function(treatment) {
@@ -578,16 +643,11 @@ ui <- fluidPage(
       ),
       actionButton("clear_files", "Clear uploaded files", class = "btn-warning"),
       br(), br(),
-      
       checkboxInput("drop_stderr", "Drop '(Std Err ...)' columns", value = TRUE),
-      
       uiOutput("channel_map_ui"),
-      
       hr(),
       uiOutput("norm_ui"),
-      
       actionButton("run", "Import + Process", class = "btn-primary"),
-      
       hr(),
       h4("Downloads"),
       downloadButton("download_prism", "Prism AUC export (csv)"),
@@ -623,8 +683,7 @@ ui <- fluidPage(
           br(),
           tags$p(
             tags$strong("How it works: "),
-            "Each row is one parsed factor group. Edit the guessed receptor, treatment, or passage once. ",
-            "When you click Apply edits, that mapping is applied everywhere the same original guess appears."
+            "Edit any receptor, treatment, or passage mapping once. The app propagates that edit to every group with the same original guess."
           ),
           fluidRow(
             column(4, actionButton("reset_editor", "Reset all edits")),
@@ -671,9 +730,6 @@ ui <- fluidPage(
 # ---------------------------
 server <- function(input, output, session) {
   
-  # ---------------------------
-  # File accumulation
-  # ---------------------------
   uploaded_files_rv <- reactiveVal(NULL)
   
   observeEvent(input$files, {
@@ -700,9 +756,6 @@ server <- function(input, output, session) {
     uploaded_files_rv(NULL)
   })
   
-  # ---------------------------
-  # Channel assignment
-  # ---------------------------
   output$channel_map_ui <- renderUI({
     req(uploaded_files_rv())
     fns <- uploaded_files_rv()$file
@@ -725,15 +778,7 @@ server <- function(input, output, session) {
         
         fluidRow(
           column(8, tags$small(fname)),
-          column(
-            4,
-            selectInput(
-              paste0("chan_", i),
-              NULL,
-              c("GFP", "NIR", "Orange", "Red", "Other"),
-              selected = default
-            )
-          )
+          column(4, selectInput(paste0("chan_", i), NULL, c("GFP", "NIR", "Orange", "Red", "Other"), selected = default))
         )
       })
     )
@@ -752,7 +797,6 @@ server <- function(input, output, session) {
         
         if (is.null(val) || is.na(val) || val == "") {
           fname <- files_df$file[i]
-          
           if (str_detect(tolower(fname), "red|nir")) return("NIR")
           if (str_detect(tolower(fname), "gfp|green")) return("GFP")
           if (str_detect(tolower(fname), "orange")) return("Orange")
@@ -764,9 +808,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # ---------------------------
-  # Plate map
-  # ---------------------------
   plate_map_tbl <- reactive({
     req(input$platemap)
     read_plate_map(input$platemap$datapath)
@@ -777,9 +818,6 @@ server <- function(input, output, session) {
     plate_map_tbl()
   }, striped = TRUE)
   
-  # ---------------------------
-  # File preview
-  # ---------------------------
   output$preview_files_dt <- renderDT({
     req(uploaded_files_rv())
     
@@ -791,9 +829,6 @@ server <- function(input, output, session) {
     bind_rows(previews)
   }, options = list(pageLength = 20, scrollX = TRUE))
   
-  # ---------------------------
-  # Normalization UI
-  # ---------------------------
   output$norm_ui <- renderUI({
     req(channel_map())
     
@@ -825,9 +860,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # ---------------------------
-  # Core import
-  # ---------------------------
   raw_long_auto_base <- eventReactive(input$run, {
     cm <- channel_map()
     
@@ -837,7 +869,7 @@ server <- function(input, output, session) {
       dat_raw <- result$dat
       
       default_passage <- if (!is.na(meta$passage[[1]]) && meta$passage[[1]] != "") {
-        paste0("Passage_", meta$passage[[1]])
+        standardize_passage_label(meta$passage[[1]])
       } else {
         "Passage_NA"
       }
@@ -862,30 +894,44 @@ server <- function(input, output, session) {
           metric = meta$metric[[1]] %||% NA_character_,
           cell_type = meta$cell_type[[1]] %||% NA_character_,
           analysis = meta$analysis[[1]] %||% NA_character_,
-          condition_id = paste(file, condition, sep = " || ")
+          condition_id = paste(file, condition, sep = " || "),
+          receptor_pm = NA_character_,
+          treatment_pm = NA_character_,
+          passage_pm = NA_character_,
+          cell_line_pm = NA_character_,
+          expt_pm = NA_character_
         )
       
       if (!is.null(input$platemap)) {
         long <- long %>%
           left_join(plate_map_tbl(), by = c("well_id" = "well")) %>%
           mutate(
+            receptor_pm = coalesce(receptor_pm.y, receptor_pm.x),
+            treatment_pm = coalesce(treatment_pm.y, treatment_pm.x),
+            passage_pm = coalesce(passage_pm.y, passage_pm.x),
+            cell_line_pm = coalesce(cell_line, cell_line_pm),
+            expt_pm = coalesce(expt, expt_pm),
             passage = coalesce(passage_pm, passage)
           ) %>%
-          select(-cell_line, -expt, -receptor_pm, -treatment_pm, -passage_pm)
+          select(
+            -receptor_pm.x, -receptor_pm.y,
+            -treatment_pm.x, -treatment_pm.y,
+            -passage_pm.x, -passage_pm.y,
+            -cell_line, -expt
+          )
       }
       
       long %>%
         select(
           condition_id, file, well_id, replicate_id, channel, passage,
           vessel_name, metric, cell_type, analysis,
+          cell_line_pm, expt_pm,
+          receptor_pm, treatment_pm, passage_pm,
           datetime, elapsed, condition, value
         )
     })
   }, ignoreInit = TRUE)
   
-  # ---------------------------
-  # HITL factor editor
-  # ---------------------------
   hitl_default <- reactive({
     req(raw_long_auto_base())
     parse_conditions_hitl(raw_long_auto_base())
@@ -921,12 +967,7 @@ server <- function(input, output, session) {
       hot_col("passage_guess", readOnly = TRUE) %>%
       hot_col("n_wells", readOnly = TRUE) %>%
       hot_col("examples", readOnly = TRUE) %>%
-      hot_table(
-        highlightCol = TRUE,
-        highlightRow = TRUE,
-        columnSorting = TRUE,
-        manualColumnMove = TRUE
-      )
+      hot_table(highlightCol = TRUE, highlightRow = TRUE, columnSorting = TRUE, manualColumnMove = TRUE)
   })
   
   observeEvent(input$editor_table, {
@@ -938,15 +979,19 @@ server <- function(input, output, session) {
     tbl <- as_tibble(tbl) %>%
       mutate(
         across(
-          c(
-            receptor_guess, treatment_guess, passage_guess,
-            examples, receptor, treatment, passage
-          ),
+          c(receptor_guess, treatment_guess, passage_guess, examples, receptor, treatment, passage),
           as.character
         ),
         n_wells = as.integer(n_wells),
-        guess_key = make_factor_key(paste(receptor_guess, passage_guess), treatment_guess)
-      )
+        receptor_guess = canonicalize_receptor_combo(receptor_guess),
+        treatment_guess = canonicalize_treatment_combo(treatment_guess),
+        passage_guess = purrr::map_chr(passage_guess, canonicalize_passage_edit),
+        receptor = canonicalize_receptor_combo(receptor),
+        treatment = canonicalize_treatment_combo(treatment),
+        passage = purrr::map_chr(passage, canonicalize_passage_edit),
+        guess_key = make_guess_key(receptor_guess, treatment_guess, passage_guess)
+      ) %>%
+      propagate_editor_mappings()
     
     editor_rv(tbl)
   })
@@ -955,11 +1000,20 @@ server <- function(input, output, session) {
     req(editor_rv())
     
     df <- editor_rv() %>%
+      propagate_editor_mappings() %>%
       mutate(
+        receptor_guess = canonicalize_receptor_combo(receptor_guess),
+        treatment_guess = canonicalize_treatment_combo(treatment_guess),
+        passage_guess = purrr::map_chr(passage_guess, canonicalize_passage_edit),
         receptor = canonicalize_receptor_combo(receptor),
         treatment = canonicalize_treatment_combo(treatment),
         passage = purrr::map_chr(passage, canonicalize_passage_edit),
+        guess_key = make_guess_key(receptor_guess, treatment_guess, passage_guess),
         factor_key = make_factor_key(receptor, treatment)
+      ) %>%
+      select(
+        guess_key, receptor_guess, treatment_guess, passage_guess,
+        n_wells, examples, receptor, treatment, passage, factor_key
       )
     
     applied_editor_rv(df)
@@ -968,24 +1022,22 @@ server <- function(input, output, session) {
   current_editor_map <- reactive({
     req(editor_rv())
     
-    df <- if (!is.null(applied_editor_rv())) {
-      applied_editor_rv()
-    } else {
-      editor_rv()
-    }
+    df <- if (!is.null(applied_editor_rv())) applied_editor_rv() else editor_rv()
     
     df %>%
+      propagate_editor_mappings() %>%
       mutate(
+        receptor_guess = canonicalize_receptor_combo(receptor_guess),
+        treatment_guess = canonicalize_treatment_combo(treatment_guess),
+        passage_guess = purrr::map_chr(passage_guess, canonicalize_passage_edit),
         receptor = canonicalize_receptor_combo(receptor),
         treatment = canonicalize_treatment_combo(treatment),
         passage = purrr::map_chr(passage, canonicalize_passage_edit),
+        guess_key = make_guess_key(receptor_guess, treatment_guess, passage_guess),
         factor_key = make_factor_key(receptor, treatment)
       )
   })
   
-  # ---------------------------
-  # Plate check and preview
-  # ---------------------------
   output$plate_check_summary <- renderPrint({
     req(raw_long_auto_base())
     
@@ -1008,34 +1060,22 @@ server <- function(input, output, session) {
       cat("Detected plate map size:", plate_size_pm, "\n")
       cat("Matched wells:", length(matched), "\n")
       
-      if (length(unmatched_data) > 0) {
-        cat("Data-only wells:", paste(sort(unmatched_data), collapse = ", "), "\n")
-      }
-      
-      if (length(unmatched_pm) > 0) {
-        cat("Plate-map-only wells:", paste(sort(unmatched_pm), collapse = ", "), "\n")
-      }
+      if (length(unmatched_data) > 0) cat("Data-only wells:", paste(sort(unmatched_data), collapse = ", "), "\n")
+      if (length(unmatched_pm) > 0) cat("Plate-map-only wells:", paste(sort(unmatched_pm), collapse = ", "), "\n")
     }
   })
   
-  plate_preview_source <- reactive({
+  annotated_conditions <- reactive({
     req(raw_long_auto_base(), current_editor_map())
     
     parsed_raw <- raw_long_auto_base() %>%
-      distinct(condition_id, file, well_id, condition) %>%
-      mutate(
-        receptor_guess = purrr::map_chr(condition, extract_receptors),
-        treatment_guess = purrr::map_chr(condition, extract_treatment),
-        passage_guess = purrr::map_chr(condition, extract_passage_from_condition),
-        passage_guess = if_else(is.na(passage_guess), "Passage_NA", passage_guess),
-        guess_key = make_factor_key(paste(receptor_guess, passage_guess), treatment_guess)
-      )
+      add_factor_guesses()
     
     em <- current_editor_map() %>%
       select(guess_key, passage, receptor, treatment, factor_key)
     
     parsed_raw %>%
-      left_join(em, by = "guess_key") %>%
+      left_join(em, by = "guess_key", suffix = c("_raw", "")) %>%
       mutate(
         passage = factor(as.character(passage)),
         receptor = factor(canonicalize_receptor_combo(as.character(receptor))),
@@ -1045,13 +1085,14 @@ server <- function(input, output, session) {
   })
   
   output$plate_check_layout <- renderUI({
-    req(plate_preview_source())
+    req(annotated_conditions())
     
-    plate_tables <- make_plate_preview_tables(plate_preview_source())
+    plate_tables <- make_plate_preview_tables(
+      annotated_conditions() %>%
+        distinct(well_id, passage, receptor, treatment)
+    )
     
-    if (length(plate_tables) == 0) {
-      return(tags$p("No well-based layout available."))
-    }
+    if (length(plate_tables) == 0) return(tags$p("No well-based layout available."))
     
     tagList(
       purrr::map(plate_tables, function(x) {
@@ -1065,9 +1106,12 @@ server <- function(input, output, session) {
   })
   
   observe({
-    req(plate_preview_source())
+    req(annotated_conditions())
     
-    plate_tables <- make_plate_preview_tables(plate_preview_source())
+    plate_tables <- make_plate_preview_tables(
+      annotated_conditions() %>%
+        distinct(well_id, passage, receptor, treatment)
+    )
     
     purrr::walk(plate_tables, function(x) {
       local({
@@ -1075,45 +1119,23 @@ server <- function(input, output, session) {
         ptbl <- x$table
         oid <- paste0("plate_layout_", make.names(pid))
         
-        output[[oid]] <- renderTable({
-          ptbl
-        }, striped = TRUE, bordered = TRUE, spacing = "xs")
+        output[[oid]] <- renderTable(
+          { ptbl },
+          striped = TRUE,
+          bordered = TRUE,
+          spacing = "xs",
+          sanitize.text.function = function(x) x
+        )
       })
     })
   })
   
-  # ---------------------------
-  # Join editor map onto raw data
-  # ---------------------------
   raw_long <- reactive({
-    req(raw_long_auto_base(), current_editor_map())
-    
-    parsed_raw <- raw_long_auto_base() %>%
-      mutate(
-        receptor_guess = purrr::map_chr(condition, extract_receptors),
-        treatment_guess = purrr::map_chr(condition, extract_treatment),
-        passage_guess = purrr::map_chr(condition, extract_passage_from_condition),
-        passage_guess = if_else(is.na(passage_guess), "Passage_NA", passage_guess),
-        guess_key = make_factor_key(paste(receptor_guess, passage_guess), treatment_guess)
-      )
-    
-    em <- current_editor_map() %>%
-      select(guess_key, passage, receptor, treatment, factor_key)
-    
-    parsed_raw %>%
-      left_join(em, by = "guess_key") %>%
-      mutate(
-        passage = factor(as.character(passage)),
-        receptor = factor(canonicalize_receptor_combo(as.character(receptor))),
-        treatment = factor(as.character(treatment)),
-        factor_key = make_factor_key(receptor, treatment)
-      ) %>%
+    req(annotated_conditions())
+    annotated_conditions() %>%
       relocate(well_id, replicate_id, passage, receptor, treatment, factor_key, .after = condition)
   })
   
-  # ---------------------------
-  # Normalize
-  # ---------------------------
   wide_joined_passage <- reactive({
     req(raw_long())
     
@@ -1128,21 +1150,23 @@ server <- function(input, output, session) {
     req(wide_joined_passage())
     
     w <- wide_joined_passage()
-    
     method <- input$norm_method %||% "ratio"
     sig <- input$signal_channel
     ctl <- input$control_channel
     
-    if (is.null(sig) || is.null(ctl) || !(sig %in% names(w)) || !(ctl %in% names(w))) {
+    if (is.null(sig) || !(sig %in% names(w))) {
+      out <- w %>% mutate(value_norm = NA_real_)
+    } else if (method == "none") {
+      out <- w %>% mutate(value_norm = .data[[sig]])
+    } else if (is.null(ctl) || !(ctl %in% names(w))) {
       out <- w %>% mutate(value_norm = NA_real_)
     } else {
       out <- w
       
-      if (method %in% c("none", "ratio", "log2ratio")) {
+      if (method %in% c("ratio", "log2ratio")) {
         out <- out %>%
           mutate(
             value_norm = case_when(
-              method == "none" ~ .data[[sig]],
               method == "ratio" ~ .data[[sig]] / .data[[ctl]],
               method == "log2ratio" ~ log2(.data[[sig]] / .data[[ctl]]),
               TRUE ~ NA_real_
@@ -1156,17 +1180,17 @@ server <- function(input, output, session) {
       } else {
         out <- out %>% mutate(value_norm = NA_real_)
       }
-      
-      if (isTRUE(input$baseline_norm)) {
-        out <- out %>%
-          group_by(passage, factor_key) %>%
-          mutate(
-            baseline = value_norm[which(!is.na(value_norm))[1]],
-            value_norm = value_norm / baseline
-          ) %>%
-          ungroup() %>%
-          select(-baseline)
-      }
+    }
+    
+    if (isTRUE(input$baseline_norm)) {
+      out <- out %>%
+        group_by(passage, factor_key) %>%
+        mutate(
+          baseline = value_norm[which(!is.na(value_norm))[1]],
+          value_norm = value_norm / baseline
+        ) %>%
+        ungroup() %>%
+        select(-baseline)
     }
     
     if (isTRUE(input$mask_spikes)) {
@@ -1191,9 +1215,6 @@ server <- function(input, output, session) {
       arrange(receptor, treatment, passage, elapsed)
   })
   
-  # ---------------------------
-  # Plot filters
-  # ---------------------------
   output$plot_time_ui <- renderUI({
     req(stats_long())
     
@@ -1265,9 +1286,6 @@ server <- function(input, output, session) {
       summarize(auc = auc_trapz(elapsed, value_norm), .groups = "drop")
   })
   
-  # ---------------------------
-  # Plots
-  # ---------------------------
   output$plot <- renderPlot({
     req(filtered_stats_long())
     
@@ -1368,9 +1386,6 @@ server <- function(input, output, session) {
     p
   })
   
-  # ---------------------------
-  # Downloads
-  # ---------------------------
   output$download_editor <- downloadHandler(
     filename = function() paste0("incucyte_editor_table_", Sys.Date(), ".csv"),
     content = function(file) write_csv(current_editor_map(), file)

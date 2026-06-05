@@ -1,7 +1,7 @@
 Package: incuzicht
 Type: Package
 Title: Tools for Incucyte Data Analysis
-Version: 0.1.0
+Version: 0.1.1
 Authors@R: 
     person("J.", "Edward van Veen", email = "you@example.com", role = c("aut", "cre"))
 Description: Tools for importing, processing, and visualizing Incucyte data.
