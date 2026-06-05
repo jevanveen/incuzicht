@@ -492,28 +492,35 @@ make_plate_preview_tables <- function(df) {
 # ---------------------------
 # Math helpers
 # ---------------------------
-mask_spikes_cooks <- function(df, value_col = "value_norm", x_col = "elapsed") {
+mask_spikes_neighbor_mad <- function(df,
+                                     value_col = "value_norm",
+                                     threshold = 3) {
   y <- df[[value_col]]
-  x <- df[[x_col]]
-  ok <- is.finite(y) & is.finite(x)
   
   df$spike_flag <- FALSE
   df$value_masked <- y
   
-  if (sum(ok) < 4) return(df)
+  n <- length(y)
+  if (n < 5) return(df)
   
-  fit <- try(lm(y[ok] ~ x[ok]), silent = TRUE)
-  if (inherits(fit, "try-error")) return(df)
+  expected <- rep(NA_real_, n)
+  expected[2:(n - 1)] <- (y[1:(n - 2)] + y[3:n]) / 2
   
-  cooks <- cooks.distance(fit)
-  cutoff <- 4 / sum(ok)
+  resid <- abs(y - expected)
+  scale <- mad(resid, na.rm = TRUE)
   
-  spike_idx_local <- which(cooks > cutoff)
-  if (length(spike_idx_local) == 0) return(df)
+  if (is.na(scale) || scale == 0) return(df)
   
-  spike_idx_global <- which(ok)[spike_idx_local]
-  df$spike_flag[spike_idx_global] <- TRUE
-  df$value_masked[spike_idx_global] <- NA_real_
+  spike_idx <- which(resid > threshold * scale)
+  
+  # Do not automatically mask first or last timepoint
+  spike_idx <- setdiff(spike_idx, c(1, n))
+  
+  if (length(spike_idx) == 0) return(df)
+  
+  df$spike_flag[spike_idx] <- TRUE
+  df$value_masked[spike_idx] <- NA_real_
+  
   df
 }
 
@@ -859,7 +866,19 @@ server <- function(input, output, session) {
         selected = "ratio"
       ),
       checkboxInput("baseline_norm", "Baseline-normalize within Passage+Factor", value = FALSE),
-      checkboxInput("mask_spikes", "Mask spikes (Cook's distance > 4/n)", value = FALSE)
+      checkboxInput("mask_spikes", "Mask local trajectory spikes", value = FALSE),
+      
+      conditionalPanel(
+        condition = "input.mask_spikes == true",
+        numericInput(
+          "spike_z_threshold",
+          "Spike threshold: local deviation > n × MAD",
+          value = 3,
+          min = 1,
+          max = 20,
+          step = 0.5
+        )
+      )
     )
   })
   
@@ -1195,9 +1214,16 @@ server <- function(input, output, session) {
     }
     
     if (isTRUE(input$mask_spikes)) {
+      threshold <- input$spike_z_threshold %||% 3
+      
       out <- out %>%
         group_by(passage, factor_key) %>%
-        group_modify(~ mask_spikes_cooks(.x, value_col = "value_norm", x_col = "elapsed")) %>%
+        arrange(elapsed, .by_group = TRUE) %>%
+        group_modify(~ mask_spikes_neighbor_mad(
+          .x,
+          value_col = "value_norm",
+          threshold = threshold
+        )) %>%
         ungroup() %>%
         mutate(value_norm = value_masked) %>%
         select(-value_masked)
