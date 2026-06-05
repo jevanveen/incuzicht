@@ -976,16 +976,23 @@ server <- function(input, output, session) {
       hot_table(highlightCol = TRUE, highlightRow = TRUE, columnSorting = TRUE, manualColumnMove = TRUE)
   })
   
-  observeEvent(input$editor_table, {
+  read_editor_table <- reactive({
     req(editor_rv())
     
+    if (is.null(input$editor_table)) {
+      return(editor_rv())
+    }
+    
     tbl_visible <- tryCatch(hot_to_r(input$editor_table), error = function(e) NULL)
-    if (is.null(tbl_visible)) return()
+    
+    if (is.null(tbl_visible)) {
+      return(editor_rv())
+    }
     
     key_map <- editor_rv() %>%
       select(original_guess, guess_key, receptor_guess, treatment_guess, passage_guess)
     
-    tbl <- as_tibble(tbl_visible) %>%
+    as_tibble(tbl_visible) %>%
       mutate(
         across(c(original_guess, example_labels, receptor, treatment, passage), as.character),
         n_matching_wells = as.integer(n_matching_wells),
@@ -997,15 +1004,12 @@ server <- function(input, output, session) {
       mutate(
         factor_key = make_factor_key(receptor, treatment)
       )
-    
-    editor_rv(tbl)
   })
-  
   
   observeEvent(input$apply_editor, {
     req(editor_rv())
     
-    df <- editor_rv() %>%
+    df <- read_editor_table() %>%
       propagate_editor_mappings() %>%
       mutate(
         receptor = clean_user_factor(receptor),
