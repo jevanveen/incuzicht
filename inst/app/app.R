@@ -494,32 +494,45 @@ make_plate_preview_tables <- function(df) {
 # ---------------------------
 mask_spikes_neighbor_mad <- function(df,
                                      value_col = "value_norm",
-                                     threshold = 3) {
+                                     threshold = 8) {
+  
   y <- df[[value_col]]
   
   df$spike_flag <- FALSE
   df$value_masked <- y
+  df$robust_z <- NA_real_
   
   n <- length(y)
-  if (n < 5) return(df)
+  
+  if (n < 5)
+    return(df)
   
   expected <- rep(NA_real_, n)
-  expected[2:(n - 1)] <- (y[1:(n - 2)] + y[3:n]) / 2
+  
+  expected[2:(n - 1)] <-
+    (y[1:(n - 2)] + y[3:n]) / 2
   
   resid <- abs(y - expected)
-  scale <- mad(resid, na.rm = TRUE)
   
-  if (is.na(scale) || scale == 0) return(df)
+  med <- median(resid, na.rm = TRUE)
+  mad_val <- mad(resid, na.rm = TRUE)
   
-  spike_idx <- which(resid > threshold * scale)
+  if (is.na(mad_val) || mad_val == 0)
+    return(df)
   
-  # Do not automatically mask first or last timepoint
+  robust_z <- (resid - med) / (1.4826 * mad_val)
+  
+  spike_idx <- which(abs(robust_z) > threshold)
+  
+  # never automatically remove first/last point
   spike_idx <- setdiff(spike_idx, c(1, n))
   
-  if (length(spike_idx) == 0) return(df)
+  if (length(spike_idx) > 0) {
+    df$spike_flag[spike_idx] <- TRUE
+    df$value_masked[spike_idx] <- NA_real_
+  }
   
-  df$spike_flag[spike_idx] <- TRUE
-  df$value_masked[spike_idx] <- NA_real_
+  df$robust_z <- robust_z
   
   df
 }
@@ -872,11 +885,11 @@ server <- function(input, output, session) {
         condition = "input.mask_spikes == true",
         numericInput(
           "spike_z_threshold",
-          "Spike threshold: local deviation > n × MAD",
-          value = 3,
-          min = 1,
-          max = 20,
-          step = 0.5
+          "Spike threshold: robust z-score",
+          value = 8,
+          min = 3,
+          max = 100,
+          step = 1
         )
       )
     )
