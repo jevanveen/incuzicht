@@ -705,8 +705,9 @@ ui <- fluidPage(
             "Edit receptor, treatment, or passage. Return commits the cell into a lightweight buffer. Apply edits propagates changes and updates downstream data."
           ),
           fluidRow(
-            column(4, actionButton("reset_editor", "Reset all edits")),
-            column(4, actionButton("apply_editor", "Apply edits", class = "btn-primary"))
+            column(4, actionButton("apply_editor", "Apply edits", class = "btn-primary")),
+            column(4, actionButton("reset_editor", "Reset all edits"))
+            
           ),
           br(),
           rHandsontableOutput("editor_table", height = "560px")
@@ -994,19 +995,24 @@ server <- function(input, output, session) {
     
     df <- editor_rv() %>%
       select(
-        original_guess,
-        n_matching_wells,
-        example_labels,
+        passage,
         receptor,
         treatment,
-        passage
+        example_labels,
+        n_matching_wells,
+        original_guess
       )
     
     rhandsontable(df, rowHeaders = NULL, stretchH = "all", height = 540) %>%
-      hot_col("original_guess", readOnly = TRUE) %>%
-      hot_col("n_matching_wells", readOnly = TRUE) %>%
       hot_col("example_labels", readOnly = TRUE) %>%
-      hot_table(highlightCol = TRUE, highlightRow = TRUE, columnSorting = TRUE, manualColumnMove = TRUE)
+      hot_col("n_matching_wells", readOnly = TRUE) %>%
+      hot_col("original_guess", readOnly = TRUE) %>%
+      hot_table(
+        highlightCol = TRUE,
+        highlightRow = TRUE,
+        columnSorting = TRUE,
+        manualColumnMove = TRUE
+      )
   })
   
   observeEvent(input$editor_table, {
