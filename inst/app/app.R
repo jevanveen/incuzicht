@@ -1360,7 +1360,7 @@ server <- function(input, output, session) {
     df
   })
   
-  timecourse_export_df <- reactive({
+  timecourse_export_long <- reactive({
     req(filtered_stats_long())
     
     filtered_stats_long() %>%
@@ -1380,6 +1380,48 @@ server <- function(input, output, session) {
         .groups = "drop"
       ) %>%
       arrange(cell_line, hormone, receptor, expt, passage, elapsed_hour)
+  })
+  
+  timecourse_prism_export_matrix <- reactive({
+    req(filtered_stats_long())
+    
+    export_long <- filtered_stats_long() %>%
+      mutate(
+        condition_label = paste(as.character(receptor), as.character(treatment), as.character(passage), sep = " | ")
+      ) %>%
+      arrange(condition_label, elapsed, factor_key)
+    
+    replicate_map <- export_long %>%
+      distinct(condition_label, factor_key) %>%
+      group_by(condition_label) %>%
+      arrange(factor_key, .by_group = TRUE) %>%
+      mutate(rep_idx = row_number()) %>%
+      ungroup()
+    
+    export_wide <- export_long %>%
+      left_join(replicate_map, by = c("condition_label", "factor_key")) %>%
+      mutate(col_key = paste0(condition_label, "__rep", rep_idx)) %>%
+      select(elapsed, col_key, value_norm) %>%
+      distinct() %>%
+      pivot_wider(names_from = col_key, values_from = value_norm) %>%
+      arrange(elapsed)
+    
+    col_template <- replicate_map %>%
+      count(condition_label, name = "n_rep") %>%
+      group_by(condition_label) %>%
+      summarise(max_rep = max(n_rep), .groups = "drop") %>%
+      mutate(col_keys = purrr::map2(condition_label, max_rep, ~ paste0(.x, "__rep", seq_len(.y)))) %>%
+      pull(col_keys) %>%
+      unlist()
+    
+    export_wide <- export_wide %>%
+      select(elapsed, any_of(col_template))
+    
+    value_cols <- names(export_wide)[-1]
+    condition_header <- c("", str_replace(value_cols, "__rep\\d+$", ""))
+    rep_header <- c("elapsed", str_extract(value_cols, "rep\\d+$"))
+    
+    rbind(condition_header, rep_header, as.matrix(export_wide))
   })
   
   auc_preview <- reactive({
@@ -1541,7 +1583,15 @@ server <- function(input, output, session) {
   output$download_timecourse <- downloadHandler(
     filename = function() paste0("incucyte_timecourse_", Sys.Date(), ".csv"),
     content = function(file) {
-      write_csv(timecourse_export_df(), file)
+      write.table(
+        timecourse_prism_export_matrix(),
+        file = file,
+        sep = ",",
+        row.names = FALSE,
+        col.names = FALSE,
+        quote = TRUE,
+        na = ""
+      )
     }
   )
   
@@ -1555,7 +1605,7 @@ server <- function(input, output, session) {
   observeEvent(input$copy_timecourse, {
     session$sendCustomMessage(
       "copy-to-clipboard",
-      list(text = clipboard_csv_text(timecourse_export_df()))
+      list(text = clipboard_matrix_csv_text(timecourse_prism_export_matrix()))
     )
   })
   
