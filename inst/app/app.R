@@ -557,6 +557,11 @@ clipboard_csv_text <- function(df) {
   paste(capture.output(write.csv(df, row.names = FALSE, na = "")), collapse = "\n")
 }
 
+clipboard_matrix_csv_text <- function(x) {
+  if (is.null(x) || length(x) == 0) return("")
+  paste(capture.output(write.table(x, sep = ",", row.names = FALSE, col.names = FALSE, quote = TRUE, na = "")), collapse = "\n")
+}
+
 classify_treatment_group <- function(treatment) {
   trt <- toupper(as.character(treatment))
   ligands <- c()
@@ -1385,6 +1390,34 @@ server <- function(input, output, session) {
       summarize(auc = auc_trapz(elapsed, value_norm), .groups = "drop")
   })
   
+  prism_auc_export_matrix <- reactive({
+    auc_df <- auc_preview() %>%
+      arrange(receptor, treatment, passage) %>%
+      group_by(receptor, treatment) %>%
+      mutate(rep_idx = row_number()) %>%
+      ungroup()
+    
+    col_template <- auc_df %>%
+      count(treatment, name = "n_rep") %>%
+      group_by(treatment) %>%
+      summarise(max_rep = max(n_rep), .groups = "drop") %>%
+      mutate(col_keys = purrr::map2(treatment, max_rep, ~ paste0(.x, "__rep", seq_len(.y)))) %>%
+      pull(col_keys) %>%
+      unlist()
+    
+    wide <- auc_df %>%
+      mutate(col_key = paste0(treatment, "__rep", rep_idx)) %>%
+      select(receptor, col_key, auc) %>%
+      pivot_wider(names_from = col_key, values_from = auc) %>%
+      select(receptor, any_of(col_template))
+    
+    value_cols <- names(wide)[-1]
+    treatment_header <- c("", str_replace(value_cols, "__rep\\d+$", ""))
+    rep_header <- c("receptor", str_extract(value_cols, "rep\\d+$"))
+    
+    rbind(treatment_header, rep_header, as.matrix(wide))
+  })
+  
   output$plot <- renderPlot({
     req(plot_tab_active())
     req(filtered_stats_long())
@@ -1493,34 +1526,8 @@ server <- function(input, output, session) {
   output$download_prism <- downloadHandler(
     filename = function() paste0("incucyte_prism_auc_", Sys.Date(), ".csv"),
     content = function(file) {
-      auc_df <- auc_preview() %>%
-        arrange(receptor, treatment, passage) %>%
-        group_by(receptor, treatment) %>%
-        mutate(rep_idx = row_number()) %>%
-        ungroup()
-      
-      col_template <- auc_df %>%
-        count(treatment, name = "n_rep") %>%
-        group_by(treatment) %>%
-        summarise(max_rep = max(n_rep), .groups = "drop") %>%
-        mutate(col_keys = purrr::map2(treatment, max_rep, ~ paste0(.x, "__rep", seq_len(.y)))) %>%
-        pull(col_keys) %>%
-        unlist()
-      
-      wide <- auc_df %>%
-        mutate(col_key = paste0(treatment, "__rep", rep_idx)) %>%
-        select(receptor, col_key, auc) %>%
-        pivot_wider(names_from = col_key, values_from = auc) %>%
-        select(receptor, any_of(col_template))
-      
-      value_cols <- names(wide)[-1]
-      treatment_header <- c("", str_replace(value_cols, "__rep\\d+$", ""))
-      rep_header <- c("receptor", str_extract(value_cols, "rep\\d+$"))
-      
-      out <- rbind(treatment_header, rep_header, as.matrix(wide))
-      
       write.table(
-        out,
+        prism_auc_export_matrix(),
         file = file,
         sep = ",",
         row.names = FALSE,
@@ -1541,7 +1548,7 @@ server <- function(input, output, session) {
   observeEvent(input$copy_auc, {
     session$sendCustomMessage(
       "copy-to-clipboard",
-      list(text = clipboard_csv_text(auc_preview()))
+      list(text = clipboard_matrix_csv_text(prism_auc_export_matrix()))
     )
   })
   
