@@ -349,60 +349,15 @@ add_factor_guesses <- function(df) {
 parse_conditions_hitl <- function(raw_tbl) {
   add_factor_guesses(raw_tbl) %>%
     distinct(condition_id, file, well_id, condition, receptor_guess, treatment_guess, passage_guess, guess_key) %>%
-    group_by(guess_key, receptor_guess, treatment_guess, passage_guess) %>%
-    summarise(
-      n_matching_wells = n_distinct(well_id[well_id != ""]),
-      example_labels = paste(head(unique(condition), 3), collapse = " | "),
-      receptor = first(receptor_guess),
-      treatment = first(treatment_guess),
-      passage = first(passage_guess),
-      .groups = "drop"
-    ) %>%
     mutate(
+      n_matching_wells = 1L,
+      example_labels = condition,
+      receptor = receptor_guess,
+      treatment = treatment_guess,
+      passage = passage_guess,
       original_guess = paste(receptor_guess, treatment_guess, passage_guess, sep = " | ")
     ) %>%
-    arrange(receptor_guess, treatment_guess, passage_guess)
-}
-
-propagate_editor_mappings <- function(tbl) {
-  tbl <- tbl %>%
-    mutate(
-      receptor_changed = clean_user_factor(receptor) != clean_user_factor(receptor_guess),
-      treatment_changed = clean_user_factor(treatment) != clean_user_factor(treatment_guess),
-      passage_changed = clean_user_factor(passage) != clean_user_factor(passage_guess)
-    )
-  
-  receptor_map <- tbl %>%
-    filter(receptor_changed) %>%
-    distinct(receptor_guess, receptor)
-  
-  treatment_map <- tbl %>%
-    filter(treatment_changed) %>%
-    distinct(treatment_guess, treatment)
-  
-  passage_map <- tbl %>%
-    filter(passage_changed) %>%
-    distinct(passage_guess, passage)
-  
-  if (nrow(receptor_map) > 0) {
-    for (i in seq_len(nrow(receptor_map))) {
-      tbl$receptor[tbl$receptor_guess == receptor_map$receptor_guess[i]] <- receptor_map$receptor[i]
-    }
-  }
-  
-  if (nrow(treatment_map) > 0) {
-    for (i in seq_len(nrow(treatment_map))) {
-      tbl$treatment[tbl$treatment_guess == treatment_map$treatment_guess[i]] <- treatment_map$treatment[i]
-    }
-  }
-  
-  if (nrow(passage_map) > 0) {
-    for (i in seq_len(nrow(passage_map))) {
-      tbl$passage[tbl$passage_guess == passage_map$passage_guess[i]] <- passage_map$passage[i]
-    }
-  }
-  
-  tbl %>% select(-receptor_changed, -treatment_changed, -passage_changed)
+    arrange(file, well_id, condition)
 }
 
 # ---------------------------
@@ -758,7 +713,7 @@ ui <- fluidPage(
           br(),
           tags$p(
             tags$strong("How it works: "),
-            "Edit receptor, treatment, or passage. Return commits the cell into a lightweight buffer. Apply edits propagates changes and updates downstream data."
+            "Each row is now a single imported condition. Edit receptor, treatment, or passage for only that condition, then apply edits to update downstream data."
           ),
           fluidRow(
             column(4, actionButton("apply_editor", "Apply edits", class = "btn-primary")),
@@ -1062,6 +1017,9 @@ server <- function(input, output, session) {
     
     df <- editor_rv() %>%
       select(
+        file,
+        well_id,
+        condition,
         passage,
         receptor,
         treatment,
@@ -1074,6 +1032,9 @@ server <- function(input, output, session) {
       hot_col("example_labels", readOnly = TRUE) %>%
       hot_col("n_matching_wells", readOnly = TRUE) %>%
       hot_col("original_guess", readOnly = TRUE) %>%
+      hot_col("file", readOnly = TRUE) %>%
+      hot_col("well_id", readOnly = TRUE) %>%
+      hot_col("condition", readOnly = TRUE) %>%
       hot_table(
         highlightCol = TRUE,
         highlightRow = TRUE,
@@ -1089,17 +1050,17 @@ server <- function(input, output, session) {
     if (is.null(tbl_visible)) return()
     
     key_map <- editor_rv() %>%
-      select(original_guess, guess_key, receptor_guess, treatment_guess, passage_guess)
+      select(condition_id, file, well_id, condition, guess_key, receptor_guess, treatment_guess, passage_guess)
     
     tbl <- as_tibble(tbl_visible) %>%
       mutate(
-        across(c(original_guess, example_labels, receptor, treatment, passage), as.character),
+        across(c(file, well_id, condition, original_guess, example_labels, receptor, treatment, passage), as.character),
         n_matching_wells = as.integer(n_matching_wells),
         receptor = clean_user_factor(receptor),
         treatment = clean_user_factor(treatment),
         passage = purrr::map_chr(passage, standardize_passage_label)
       ) %>%
-      left_join(key_map, by = "original_guess") %>%
+      left_join(key_map, by = c("file", "well_id", "condition")) %>%
       mutate(
         factor_key = make_factor_key(receptor, treatment)
       )
@@ -1111,7 +1072,6 @@ server <- function(input, output, session) {
     req(editor_buffer_rv())
     
     df <- editor_buffer_rv() %>%
-      propagate_editor_mappings() %>%
       mutate(
         receptor = clean_user_factor(receptor),
         treatment = clean_user_factor(treatment),
@@ -1135,7 +1095,8 @@ server <- function(input, output, session) {
         treatment = clean_user_factor(treatment),
         passage = purrr::map_chr(passage, standardize_passage_label),
         factor_key = make_factor_key(receptor, treatment)
-      )
+      ) %>%
+      select(condition_id, passage, receptor, treatment, factor_key)
   })
   
   output$plate_check_summary <- renderPrint({
@@ -1172,10 +1133,10 @@ server <- function(input, output, session) {
       add_factor_guesses()
     
     em <- current_editor_map() %>%
-      select(guess_key, passage, receptor, treatment, factor_key)
+      select(condition_id, passage, receptor, treatment, factor_key)
     
     parsed_raw %>%
-      left_join(em, by = "guess_key", suffix = c("_raw", "")) %>%
+      left_join(em, by = "condition_id", suffix = c("_raw", "")) %>%
       mutate(
         passage = factor(clean_user_factor(passage)),
         receptor = factor(clean_user_factor(receptor)),
