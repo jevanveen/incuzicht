@@ -15,7 +15,7 @@ library(DT)
 # Low-level helpers
 # ---------------------------
 find_data_header_row <- function(lines) {
-  idx <- which(str_detect(lines, "^Date Time\tElapsed\\b"))
+  idx <- which(str_detect(lines, "^Date\\s*Time\tElapsed\\b"))
   if (length(idx) == 0) return(NA_integer_)
   idx[1]
 }
@@ -29,8 +29,10 @@ extract_key_value <- function(lines, key) {
 }
 
 extract_well_id <- function(x) {
-  m <- str_match(x, "\\(([A-H][0-9]{1,2})\\)")
-  out <- m[, 2]
+  z <- toupper(str_squish(as.character(x)))
+  m_paren <- str_match(z, "\\(([A-H][0-9]{1,2})\\)")
+  m_bare <- str_match(z, "^([A-H][0-9]{1,2})$")
+  out <- coalesce(m_paren[, 2], m_bare[, 2], "")
   out[is.na(out)] <- ""
   out
 }
@@ -142,11 +144,13 @@ canonicalize_treatment_one <- function(x) {
   
   parts <- str_split(z, "\\s*\\+\\s*", simplify = FALSE)[[1]]
   parts <- toupper(str_squish(parts))
+  parts <- str_replace_all(parts, "\\bRU\\s*486\\b", "RU-486")
+  parts <- str_replace_all(parts, "\\bFULVESTRANT\\b", "FUL")
   parts <- parts[parts != ""]
   parts <- unique(parts)
   
   get_ligand <- function(s) {
-    m <- str_match(s, "\\b(E2|P4|DHT|4-OHT|DEX|CORT|RU-486|NET)\\b")
+    m <- str_match(s, "\\b(E2|P4|DHT|4-OHT|DEX|CORT|RU-486|NET|FUL)\\b")
     lig <- m[, 2]
     ifelse(is.na(lig), "ZZZ", lig)
   }
@@ -157,7 +161,7 @@ canonicalize_treatment_one <- function(x) {
     ifelse(is.na(dose), Inf, dose)
   }
   
-  ligand_order <- c("E2", "P4", "DHT", "4-OHT", "NET", "RU-486", "DEX", "CORT", "ZZZ")
+  ligand_order <- c("E2", "P4", "DHT", "4-OHT", "NET", "RU-486", "FUL", "DEX", "CORT", "ZZZ")
   ord_lig <- match(get_ligand(parts), ligand_order)
   ord_dose <- get_dose(parts)
   
@@ -195,9 +199,15 @@ clean_condition_header <- function(x) {
   x %>%
     str_to_lower() %>%
     str_replace_all("\\([a-h][0-9]{1,2}\\)", " ") %>%
+    str_replace_all(",", " + ") %>%
     str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ul\\b", " ") %>%
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*k\\s*/\\s*well\\b", " ") %>%
     str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*mg/ml\\b", " ") %>%
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*ug/ml\\b", " ") %>%
+    str_replace_all("\\b[0-9]+\\.?[0-9]*\\s*µg/ml\\b", " ") %>%
     str_replace_all("([0-9]+\\.?[0-9]*)(pm|nm|um|\u00b5m|mm)\\b", "\\1 \\2") %>%
+    str_replace_all("\\bru\\s*486\\b", "ru-486") %>%
+    str_replace_all("\\bfulvestrant\\b", "ful") %>%
     str_replace_all("_", " ") %>%
     str_replace_all("\\s*\\+\\s*", " + ") %>%
     str_replace_all("\\s+", " ") %>%
@@ -245,7 +255,7 @@ extract_treatment <- function(x) {
   
   is_num <- function(z) str_detect(z, "^[0-9]+\\.?[0-9]*$")
   is_unit <- function(z) str_detect(z, regex("^(pm|nm|um|\u00b5m|mm)$", ignore_case = TRUE))
-  is_ligand <- function(z) str_detect(z, regex("^(e2|p4|dht|4-oht|dex|cort|ru-486|net)$", ignore_case = TRUE))
+  is_ligand <- function(z) str_detect(z, regex("^(e2|p4|dht|4-oht|dex|cort|ru-486|net|ful)$", ignore_case = TRUE))
   
   norm_unit <- function(z) {
     z <- toupper(z)
@@ -299,7 +309,7 @@ extract_treatment <- function(x) {
   
   s2 <- s %>%
     str_replace_all(
-      "\\b(era|er a|erb|er b|er|esr1|esr2|pra|pr a|prb|pr b|pgr|pr|ar|gr|mr|androgen receptor|glucocorticoid receptor|mineralocorticoid receptor)\\b",
+      "\\b(era|er a|erb|er b|er|esr1|esr2|pra|pr a|prb|pr b|pgr|pr|ar|gr|mr|androgen receptor|glucocorticoid receptor|mineralocorticoid receptor|hek293t|293t|noer|reporter)\\b",
       " "
     ) %>%
     str_replace_all("\\s*\\+\\s*", " + ") %>%
@@ -587,6 +597,11 @@ preview_tabular_file <- function(path, n = 20) {
   read_delim(I(txt), delim = "\t", show_col_types = FALSE, n_max = n)
 }
 
+clipboard_csv_text <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return("")
+  paste(capture.output(write.csv(df, row.names = FALSE, na = "")), collapse = "\n")
+}
+
 classify_treatment_group <- function(treatment) {
   trt <- toupper(as.character(treatment))
   ligands <- c()
@@ -596,6 +611,7 @@ classify_treatment_group <- function(treatment) {
   if (str_detect(trt, "\\bDHT\\b")) ligands <- c(ligands, "DHT")
   if (str_detect(trt, "\\b4-OHT\\b")) ligands <- c(ligands, "4-OHT")
   if (str_detect(trt, "\\bRU-486\\b")) ligands <- c(ligands, "RU-486")
+  if (str_detect(trt, "\\bFUL\\b")) ligands <- c(ligands, "FUL")
   if (str_detect(trt, "\\bDEX\\b|\\bCORT\\b|\\bGLUCO\\b")) ligands <- c(ligands, "Glucocorticoid")
   if (str_detect(trt, "\\bNET\\b")) ligands <- c(ligands, "NET")
   
@@ -604,8 +620,9 @@ classify_treatment_group <- function(treatment) {
 }
 
 treatment_levels_master <- c(
-  "VEH", "E2", "P4", "DHT", "NET", "4-OHT", "RU-486", "Glucocorticoid",
+  "VEH", "E2", "P4", "DHT", "NET", "4-OHT", "RU-486", "FUL", "Glucocorticoid",
   "E2 + P4", "E2 + DHT", "E2 + NET", "E2 + 4-OHT", "E2 + RU-486",
+  "E2 + FUL",
   "P4 + DHT", "P4 + 4-OHT", "P4 + RU-486",
   "DHT + 4-OHT", "DHT + RU-486", "4-OHT + RU-486"
 )
@@ -618,12 +635,14 @@ treatment_color_values <- c(
   "NET" = "#00C896",
   "4-OHT" = "#7A3CFF",
   "RU-486" = "#9E9E9E",
+  "FUL" = "#A04E2A",
   "Glucocorticoid" = "#00A878",
   "E2 + P4" = "#C23B8E",
   "E2 + DHT" = "#8A4DFF",
   "E2 + NET" = "#5BB8A0",
   "E2 + 4-OHT" = "#B04DFF",
   "E2 + RU-486" = "#B85A8A",
+  "E2 + FUL" = "#C66B52",
   "P4 + DHT" = "#7F9CFF",
   "P4 + 4-OHT" = "#C06A88",
   "P4 + RU-486" = "#C08A60",
@@ -646,6 +665,40 @@ compute_auc_export_dims <- function(df) {
 # UI
 # ---------------------------
 ui <- fluidPage(
+  tags$head(
+    tags$script(HTML(
+      "Shiny.addCustomMessageHandler('copy-to-clipboard', async function(message) {
+        const text = (message && message.text) || '';
+        const fallback = function() {
+          const area = document.createElement('textarea');
+          area.value = text;
+          area.setAttribute('readonly', '');
+          area.style.position = 'fixed';
+          area.style.opacity = '0';
+          document.body.appendChild(area);
+          area.focus();
+          area.select();
+          document.execCommand('copy');
+          document.body.removeChild(area);
+        };
+        try {
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+          } else {
+            fallback();
+          }
+          Shiny.setInputValue('clipboard_copy_status', { ok: true, nonce: Date.now() }, { priority: 'event' });
+        } catch (err) {
+          try {
+            fallback();
+            Shiny.setInputValue('clipboard_copy_status', { ok: true, nonce: Date.now() }, { priority: 'event' });
+          } catch (fallbackErr) {
+            Shiny.setInputValue('clipboard_copy_status', { ok: false, nonce: Date.now() }, { priority: 'event' });
+          }
+        }
+      });"
+    ))
+  ),
   titlePanel("Incucyte Multi-File Import + Channel Normalization"),
   
   sidebarLayout(
@@ -671,6 +724,9 @@ ui <- fluidPage(
       h4("Downloads"),
       downloadButton("download_prism", "Prism AUC export (csv)"),
       downloadButton("download_timecourse", "Timecourse data (csv)"),
+      br(), br(),
+      actionButton("copy_auc", "Copy AUC to clipboard"),
+      actionButton("copy_timecourse", "Copy timelapse to clipboard")
     ),
     
     mainPanel(
@@ -755,6 +811,7 @@ server <- function(input, output, session) {
   })
   
   uploaded_files_rv <- reactiveVal(NULL)
+  preview_files_rv <- reactiveVal(NULL)
   
   observeEvent(input$files, {
     req(input$files)
@@ -778,7 +835,23 @@ server <- function(input, output, session) {
   
   observeEvent(input$clear_files, {
     uploaded_files_rv(NULL)
+    preview_files_rv(NULL)
   })
+  
+  observeEvent(uploaded_files_rv(), {
+    files_df <- uploaded_files_rv()
+    if (is.null(files_df) || nrow(files_df) == 0) {
+      preview_files_rv(NULL)
+      return()
+    }
+    
+    previews <- purrr::imap(files_df$path, function(path, i) {
+      dat <- preview_tabular_file(path, n = 20)
+      dat %>% mutate(`..file` = files_df$file[i], .before = 1)
+    })
+    
+    preview_files_rv(bind_rows(previews))
+  }, ignoreNULL = FALSE)
   
   output$channel_map_ui <- renderUI({
     req(uploaded_files_rv())
@@ -843,15 +916,9 @@ server <- function(input, output, session) {
   }, striped = TRUE)
   
   output$preview_files_dt <- renderDT({
-    req(uploaded_files_rv())
-    
-    previews <- purrr::imap(uploaded_files_rv()$path, function(path, i) {
-      dat <- preview_tabular_file(path, n = 20)
-      dat %>% mutate(`..file` = uploaded_files_rv()$file[i], .before = 1)
-    })
-    
-    bind_rows(previews)
-  }, options = list(pageLength = 20, scrollX = TRUE))
+    req(preview_files_rv())
+    datatable(preview_files_rv(), options = list(pageLength = 20, scrollX = TRUE), rownames = FALSE)
+  }, server = TRUE)
   
   output$norm_ui <- renderUI({
     req(channel_map())
@@ -1327,6 +1394,28 @@ server <- function(input, output, session) {
     df
   })
   
+  timecourse_export_df <- reactive({
+    req(filtered_stats_long())
+    
+    filtered_stats_long() %>%
+      mutate(
+        cell_line = factor("unknown"),
+        hormone = factor(as.character(treatment), ordered = TRUE),
+        receptor = factor(as.character(receptor)),
+        expt = factor("1"),
+        passage = factor(str_replace(as.character(passage), "^Passage_", "p")),
+        elapsed_hour = elapsed,
+        id = factor(paste0(expt, "_", passage))
+      ) %>%
+      group_by(cell_line, hormone, receptor, expt, passage, elapsed_hour, id) %>%
+      summarise(
+        mean_count = mean(value_norm, na.rm = TRUE),
+        median_count = median(value_norm, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      arrange(cell_line, hormone, receptor, expt, passage, elapsed_hour)
+  })
+  
   auc_preview <- reactive({
     req(filtered_stats_long())
     
@@ -1484,29 +1573,31 @@ server <- function(input, output, session) {
   output$download_timecourse <- downloadHandler(
     filename = function() paste0("incucyte_timecourse_", Sys.Date(), ".csv"),
     content = function(file) {
-      req(filtered_stats_long())
-      
-      df <- filtered_stats_long() %>%
-        mutate(
-          cell_line = factor("unknown"),
-          hormone = factor(as.character(treatment), ordered = TRUE),
-          receptor = factor(as.character(receptor)),
-          expt = factor("1"),
-          passage = factor(str_replace(as.character(passage), "^Passage_", "p")),
-          elapsed_hour = elapsed,
-          id = factor(paste0(expt, "_", passage))
-        ) %>%
-        group_by(cell_line, hormone, receptor, expt, passage, elapsed_hour, id) %>%
-        summarise(
-          mean_count = mean(value_norm, na.rm = TRUE),
-          median_count = median(value_norm, na.rm = TRUE),
-          .groups = "drop"
-        ) %>%
-        arrange(cell_line, hormone, receptor, expt, passage, elapsed_hour)
-      
-      write_csv(df, file)
+      write_csv(timecourse_export_df(), file)
     }
   )
+  
+  observeEvent(input$copy_auc, {
+    session$sendCustomMessage(
+      "copy-to-clipboard",
+      list(text = clipboard_csv_text(auc_preview()))
+    )
+  })
+  
+  observeEvent(input$copy_timecourse, {
+    session$sendCustomMessage(
+      "copy-to-clipboard",
+      list(text = clipboard_csv_text(timecourse_export_df()))
+    )
+  })
+  
+  observeEvent(input$clipboard_copy_status, {
+    if (isTRUE(input$clipboard_copy_status$ok)) {
+      showNotification("Copied to clipboard.", type = "message", duration = 2)
+    } else {
+      showNotification("Clipboard copy failed in this browser session.", type = "error", duration = 4)
+    }
+  })
   
   output$download_auc_plot_png <- downloadHandler(
     filename = function() paste0("incucyte_auc_plot_", Sys.Date(), ".png"),
