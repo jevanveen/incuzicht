@@ -350,14 +350,41 @@ parse_conditions_hitl <- function(raw_tbl) {
   add_factor_guesses(raw_tbl) %>%
     distinct(condition_id, file, well_id, condition, receptor_guess, treatment_guess, passage_guess, guess_key) %>%
     mutate(
-      n_matching_wells = 1L,
-      example_labels = condition,
       receptor = receptor_guess,
       treatment = treatment_guess,
       passage = passage_guess,
       original_guess = paste(receptor_guess, treatment_guess, passage_guess, sep = " | ")
     ) %>%
+    update_editor_matching_wells() %>%
     arrange(file, well_id, condition)
+}
+
+update_editor_matching_wells <- function(tbl) {
+  tbl %>%
+    mutate(
+      well_id = as.character(well_id),
+      receptor = clean_user_factor(receptor),
+      treatment = clean_user_factor(treatment),
+      passage = purrr::map_chr(passage, standardize_passage_label)
+    ) %>%
+    group_by(passage, receptor, treatment) %>%
+    mutate(n_matching_wells = n_distinct(well_id[well_id != ""])) %>%
+    ungroup()
+}
+
+make_zicht_export_df <- function(df) {
+  df %>%
+    transmute(
+      well = toupper(str_squish(as.character(well_id))),
+      hormone = as.character(treatment),
+      receptor = as.character(receptor),
+      passage = as.character(passage),
+      expt = as.character(expt_pm),
+      cell_line = as.character(cell_line_pm)
+    ) %>%
+    filter(!is.na(well), well != "") %>%
+    distinct(well, .keep_all = TRUE) %>%
+    arrange(well)
 }
 
 # ---------------------------
@@ -698,9 +725,9 @@ ui <- fluidPage(
           br(),
           fileInput(
             "platemap",
-            "Upload plate map (.csv)",
+            "Upload plate map (.csv/.zicht)",
             multiple = FALSE,
-            accept = c(".csv")
+            accept = c(".csv", ".zicht")
           ),
           br(),
           h4("Plate map preview"),
@@ -722,7 +749,8 @@ ui <- fluidPage(
           ),
           fluidRow(
             column(4, actionButton("apply_editor", "Apply edits", class = "btn-primary")),
-            column(4, actionButton("reset_editor", "Reset all edits"))
+            column(4, actionButton("reset_editor", "Reset all edits")),
+            column(4, downloadButton("download_zicht", "Export .zicht"))
             
           ),
           br(),
@@ -1024,17 +1052,15 @@ server <- function(input, output, session) {
       select(
         file,
         well_id,
-        condition,
         passage,
         receptor,
         treatment,
-        example_labels,
+        condition,
         n_matching_wells,
         original_guess
       )
     
     rhandsontable(df, rowHeaders = NULL, stretchH = "all", height = 540) %>%
-      hot_col("example_labels", readOnly = TRUE) %>%
       hot_col("n_matching_wells", readOnly = TRUE) %>%
       hot_col("original_guess", readOnly = TRUE) %>%
       hot_col("file", readOnly = TRUE) %>%
@@ -1059,7 +1085,7 @@ server <- function(input, output, session) {
     
     tbl <- as_tibble(tbl_visible) %>%
       mutate(
-        across(c(file, well_id, condition, original_guess, example_labels, receptor, treatment, passage), as.character),
+        across(c(file, well_id, condition, original_guess, receptor, treatment, passage), as.character),
         n_matching_wells = as.integer(n_matching_wells),
         receptor = clean_user_factor(receptor),
         treatment = clean_user_factor(treatment),
@@ -1068,7 +1094,8 @@ server <- function(input, output, session) {
       left_join(key_map, by = c("file", "well_id", "condition")) %>%
       mutate(
         factor_key = make_factor_key(receptor, treatment)
-      )
+      ) %>%
+      update_editor_matching_wells()
     
     editor_buffer_rv(tbl)
   })
@@ -1082,7 +1109,8 @@ server <- function(input, output, session) {
         treatment = clean_user_factor(treatment),
         passage = purrr::map_chr(passage, standardize_passage_label),
         factor_key = make_factor_key(receptor, treatment)
-      )
+      ) %>%
+      update_editor_matching_wells()
     
     applied_editor_rv(df)
     editor_rv(df)
@@ -1102,6 +1130,14 @@ server <- function(input, output, session) {
         factor_key = make_factor_key(receptor, treatment)
       ) %>%
       select(condition_id, passage, receptor, treatment, factor_key)
+  })
+  
+  zicht_export_df <- reactive({
+    req(raw_long_auto_base(), current_editor_map())
+    
+    annotated_conditions() %>%
+      distinct(well_id, receptor, treatment, passage, expt_pm, cell_line_pm) %>%
+      make_zicht_export_df()
   })
   
   output$plate_check_summary <- renderPrint({
@@ -1574,6 +1610,24 @@ server <- function(input, output, session) {
         sep = ",",
         row.names = FALSE,
         col.names = FALSE,
+        quote = TRUE,
+        na = ""
+      )
+    }
+  )
+  
+  output$download_zicht <- downloadHandler(
+    filename = function() {
+      base_name <- uploaded_files_rv()$file[1] %||% "incucyte_platemap"
+      paste0(tools::file_path_sans_ext(base_name), ".zicht")
+    },
+    content = function(file) {
+      write.table(
+        zicht_export_df(),
+        file = file,
+        sep = ",",
+        row.names = FALSE,
+        col.names = TRUE,
         quote = TRUE,
         na = ""
       )

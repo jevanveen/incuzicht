@@ -1,11 +1,11 @@
 name: incuzicht
-title: incuzicht
+title: app
 username: vanveen
 account: vanveen
 server: shinyapps.io
 hostUrl: https://api.shinyapps.io/v1
 appId: 17338779
-bundleId: 11979629
+bundleId: 12101593
 url: https://vanveen.shinyapps.io/incuzicht/
 version: 1
 asMultiple: FALSE
