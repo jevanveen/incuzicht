@@ -10,4 +10,18 @@ Encoding: UTF-8
 LazyData: true
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.2
-Imports: shiny
+Depends: R (>= 4.1.0)
+Imports:
+    shiny (>= 1.6.0),
+    cachem,
+    tidyverse,
+    dplyr,
+    tidyr,
+    purrr,
+    tibble,
+    ggplot2,
+    readr,
+    stringr,
+    DT,
+    digest,
+    svglite

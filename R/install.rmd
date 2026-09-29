@@ -1,3 +1,8 @@
+---
+title: "Installing and using incuzicht"
+output: html_document
+---
+
 # Overview
 
 incuzicht is a Shiny app for importing, normalizing, visualizing, and analyzing Incucyte timecourse data.
@@ -11,7 +16,7 @@ It supports:
 -   plate map import
 -   normalization
 -   AUC plotting
--   statistics
+-   per-well AUC calculations
 -   CSV exports
 
 ------------------------------------------------------------------------
@@ -32,7 +37,54 @@ R version 4.1 or newer is recommended.
 ## 2. Install required packages
 
 Run this once in R:
-```{r}
-install.packages(c( "shiny", "tidyverse", "readr", "stringr", "rhandsontable", "broom", "DT", "remotes", "devtools"))
-devtools::install_github(jevanveen/incuzicht)
+```{r, eval=FALSE}
+install.packages("remotes")
+remotes::install_github("jevanveen/incuzicht")
+incuzicht::run_incuzicht()
 ```
+
+Required application packages are installed automatically from the package's Imports.
+
+# Responsive editing and caching
+
+The factor editor uses a paginated, searchable DT table. The Field, Value and update controls sit above the table. Double-click an editable cell to change it, or select rows and use Update selected rows to assign a common experiment, cell line, passage, receptor, or treatment. Update all rows assigns the selected field and value to every imported row, including other pages and rows hidden by filters. Sorting and paging preserve the underlying condition identities. Apply edits commits the buffered changes to analysis and refreshes matching-well counts; Reset all edits restores the imported guesses.
+
+Files are parsed once per upload and reused for preview and processing. Identical condition labels share parsed guesses across channel files and repeated processing within the session. Metadata lives in a separate well table: changing labels does not repeat normalization or numerical AUC integration. Conflicting channel metadata still blocks analysis until corrected.
+
+Normalization, numerical AUC results, and plots are cached within each session. Cache keys include the measurement data and all applicable numerical settings; label/filter changes update the corresponding displays and exports. Results and plot caches are bounded to 64 MiB, with a separate 8 MiB label cache. Nothing is shared between users or saved to disk, and clearing uploads clears the caches. Plate layouts are calculated only when the Plate map tab is active; the AUC coverage table uses server-side pagination.
+
+# Import and plate identity
+
+Upload Incucyte tab-delimited exports, assign the signal and control channels, and check the Plate assignment selector for each file. Matching filename stems (after removing a trailing channel name), vessel names, first timestamps, and well layouts are used to suggest channel pairs. Check these suggestions: exports with different names may need to be assigned to the same plate manually. Use a Separate plate choice to split an incorrectly paired file. Duplicate filenames are retained.
+
+Each plate has a hidden identifier. Each well remains separate through normalization, plotting, AUC calculation, and CSV export. The app does not average wells together. Channel files assigned to the same plate must agree on well metadata; duplicate observations within a plate/well/channel/time block processing until plate assignments are corrected.
+
+96-well coordinates A1 through H12 are supported, including lowercase and zero-padded forms such as a01. Unrecognized well labels retain separate condition identities and are flagged for review.
+
+Plate maps require well, hormone, and receptor columns. Optional passage, expt, and cell_line columns populate the factor editor. Exported .zicht maps also include plate_id so repeated well names on different plates survive export and reimport. A map without plate_id is accepted for a single plate only. For multiple plates, import a map exported from the corresponding plate assignments; unmatched identifiers are rejected rather than applied to another plate. Automatically assigned identifiers are reproducible for the same inputs and pairing order; manual Separate choices are tied to the corresponding source file and occurrence.
+
+Assign experiment and cell line in the factor editor, then Apply edits. A warning above the plots identifies missing metadata and distinct wells or plates with identical experiment/cell-line/passage/receptor/treatment labels. Identical labels may be intentional replicates; their data remain separate. Reprocessing resets factor edits.
+
+# Numerical handling
+
+The Import tab reports zero control values and other numerical problems. The default replaces undefined normalized values with missing values; alternatives exclude the affected well's entire trajectory or replace zero controls with an explicitly chosen positive floor. The floor changes only zero control values and is never applied automatically to nonzero or missing measurements. For one-channel data, select None to keep raw signal.
+
+A zero or invalid initial baseline can leave the trajectory missing (default), use the first finite nonzero baseline with a warning, or retain the unscaled trajectory. Constant controls or fewer than three usable pairs cannot support OLS adjustment: choose missing values (default) or explicitly retain raw signal.
+
+AUC defaults to missing for any trajectory containing missing measurements. Alternatives integrate only adjacent valid intervals (partial coverage) or explicitly bridge missing points. Plot lines preserve missing-point gaps. The selected time window also applies to exports. The on-screen Coverage table retains plate/well identifiers for checking data; both AUC CSV downloads omit those identifiers. Different coverage windows should be reviewed before comparing AUC values.
+
+# Treatment display and AUC matrices
+
+Time-course plots use receptor colors plus treatment-specific line patterns and point symbols. AUC plots use treatment colors and symbols. Legends show full treatment labels, including doses, and the same treatment keeps its styles when plot filters change. PNG and SVG downloads use the same AUC styling.
+
+AUC matrix downloads and Copy AUC use one column per treatment, with receptor and replicate columns at the left. Replicates stack in rows within each receptor, rather than adding columns for each well. Every AUC is retained individually; unequal replicate counts and missing values produce blank cells. Replicate numbers are assigned independently within each receptor/treatment group and do not establish biological pairing across treatments.
+
+For example:
+
+| receptor | replicate | VEH | 30NM E2 |
+|----------|-----------|-----|---------|
+| ER_a | 1 | 10 | 15 |
+| ER_a | 2 | 12 | 18 |
+| ER_a | 3 | 11 | |
+
+The separate AUC values and coverage CSV includes experiment, cell line, passage, treatment, generic replicate number and coverage details, without plate or well identifiers. Internal identities and .zicht plate-map exports remain intact.
