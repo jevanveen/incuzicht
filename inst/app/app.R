@@ -147,12 +147,18 @@ canonicalize_receptor_one <- function(x) {
   if (length(x) != 1) stop("canonicalize_receptor_one expects scalar input")
   if (is.na(x) || x == "" || tolower(x) == "none") return("none")
   
-  parts <- str_split(as.character(x), "\\s*\\+\\s*", simplify = FALSE)[[1]]
+  parts <- str_split(as.character(x), "\\s*[+;]\\s*", simplify = FALSE)[[1]]
   parts <- str_squish(parts)
   parts <- parts[parts != ""]
   parts <- unique(parts)
   
   canon_part <- function(p) {
+    normalized <- p %>% str_to_lower() %>% str_replace_all("α", "a") %>% str_replace_all("β", "b")
+    mutation <- str_match(normalized, "^(.*?)((?:[\\s_-]*[a-z][0-9]+[a-z])+)$")
+    if (!is.na(mutation[1, 2]) && mutation[1, 2] != "") {
+      substitutions <- str_extract_all(mutation[1, 3], "[a-z][0-9]+[a-z]")[[1]]
+      return(paste(c(canonicalize_receptor_one(str_trim(mutation[1, 2])), toupper(substitutions)), collapse = "-"))
+    }
     z <- p %>%
       str_to_lower() %>%
       str_replace_all("\u03b1", "a") %>%
@@ -166,9 +172,10 @@ canonicalize_receptor_one <- function(x) {
       z %in% c("pgr", "pr")                                 ~ "PR",
       z %in% c("pra", "pr a", "pr_a")                       ~ "PR_a",
       z %in% c("prb", "pr b", "pr_b")                       ~ "PR_b",
-      z %in% c("ar")                                        ~ "AR",
-      z %in% c("gr")                                        ~ "GR",
-      z %in% c("mr")                                        ~ "MR",
+      z %in% c("ar", "androgen receptor", "nr3c4")            ~ "AR",
+      z %in% c("gr", "glucocorticoid receptor", "nr3c1")      ~ "GR",
+      z %in% c("mr", "mineralocorticoid receptor", "nr3c2")   ~ "MR",
+      z == "noer"                                           ~ "NOER",
       z %in% c("", "none", "na")                            ~ "none",
       TRUE                                                  ~ str_trim(p)
     )
@@ -265,32 +272,15 @@ clean_condition_header <- function(x) {
     str_trim()
 }
 
+receptor_token_pattern <- paste0(
+  "\\b(?:noer|er[ _]?[abαβ]|esr[12]|er[12]?|pr[ _]?[ab]|pgr|pr|",
+  "androgen receptor|glucocorticoid receptor|mineralocorticoid receptor|nr3c[124]|ar|gr|mr)",
+  "(?:[\\s_-]*[a-z][0-9]+[a-z])*\\b"
+)
+
 extract_receptors <- function(x) {
   s <- clean_condition_header(x)
-  recs <- c()
-  
-  if (str_detect(s, "\\berb\\b|\\ber b\\b|\\besr2\\b|\\ber2\\b")) recs <- c(recs, "ER_b")
-  
-  if (str_detect(s, "\\bera\\b|\\ber a\\b|\\besr1\\b|\\ber1\\b")) {
-    recs <- c(recs, "ER_a")
-  } else if (str_detect(s, "\\ber\\b") && !str_detect(s, "\\berb\\b|\\ber b\\b")) {
-    recs <- c(recs, "ER_a")
-  }
-  
-  if (str_detect(s, "\\bpra\\b|\\bpr a\\b")) recs <- c(recs, "PR_a")
-  if (str_detect(s, "\\bprb\\b|\\bpr b\\b")) recs <- c(recs, "PR_b")
-  
-  if (
-    str_detect(s, "\\bpgr\\b") ||
-    (str_detect(s, "\\bpr\\b") && !str_detect(s, "\\bpra\\b|\\bpr a\\b|\\bprb\\b|\\bpr b\\b"))
-  ) {
-    recs <- c(recs, "PR")
-  }
-  
-  if (str_detect(s, "\\bar\\b|\\bandrogen receptor\\b|\\bnr3c4\\b")) recs <- c(recs, "AR")
-  if (str_detect(s, "\\bgr\\b|\\bglucocorticoid receptor\\b|\\bnr3c1\\b")) recs <- c(recs, "GR")
-  if (str_detect(s, "\\bmr\\b|\\bmineralocorticoid receptor\\b|\\bnr3c2\\b")) recs <- c(recs, "MR")
-  
+  recs <- str_extract_all(s, receptor_token_pattern)[[1]]
   if (length(recs) == 0) return("none")
   canonicalize_receptor_one(paste(recs, collapse = " + "))
 }
@@ -359,6 +349,7 @@ extract_treatment <- function(x) {
   if (veh_only) return("VEH")
   
   s2 <- s %>%
+    str_remove_all(receptor_token_pattern) %>%
     str_replace_all(
       "\\b(era|er a|erb|er b|er|esr1|esr2|pra|pr a|prb|pr b|pgr|pr|ar|gr|mr|androgen receptor|glucocorticoid receptor|mineralocorticoid receptor|hek293t|293t|noer|reporter)\\b",
       " "
@@ -933,14 +924,15 @@ ui <- fluidPage(
             
           ),
           br(),
-          tags$p("Double-click a cell to edit it, or use the controls above the table to update selected rows or all rows. Update all rows includes rows on other pages and rows hidden by filters. Edits affect analysis only after Apply edits."),
+          tags$p("Double-click a cell to edit it, or use the controls above the table to update selected rows or all rows. Selections clear automatically after edits; use Clear selection to deselect rows at any time. Update all rows includes rows on other pages and rows hidden by filters. Edits affect analysis only after Apply edits."),
           fluidRow(
             column(4, selectInput("bulk_field", "Field", c("Experiment" = "expt", "Cell line" = "cell_line",
                                                             "Passage" = "passage", "Receptor" = "receptor", "Treatment" = "treatment"))),
             column(4, textInput("bulk_value", "Value")),
             column(4,
                    actionButton("bulk_edit", "Update selected rows"),
-                   actionButton("bulk_edit_all", "Update all rows"))
+                   actionButton("bulk_edit_all", "Update all rows"),
+                   actionButton("clear_editor_selection", "Clear selection"))
           ),
           br(),
           DTOutput("editor_table")
@@ -1300,6 +1292,7 @@ server <- function(input, output, session) {
     editor_rv(hitl_default())
     editor_buffer_rv(hitl_default())
     applied_editor_rv(NULL)
+    selectRows(editor_proxy, NULL)
   })
   
   output$editor_table <- renderDT({
@@ -1314,8 +1307,12 @@ server <- function(input, output, session) {
   observeEvent(editor_buffer_rv(), {
     req(editor_initialized())
     replaceData(editor_proxy, editor_display(editor_buffer_rv()), rownames = FALSE,
-                resetPaging = FALSE, clearSelection = "none")
+                resetPaging = FALSE, clearSelection = "all")
   }, ignoreNULL = TRUE)
+
+  observeEvent(input$clear_editor_selection, {
+    selectRows(editor_proxy, NULL)
+  })
 
   update_editor_cells <- function(rows, field, value) {
     data <- editor_buffer_rv()
@@ -1326,6 +1323,7 @@ server <- function(input, output, session) {
     value <- if (field == "passage") standardize_passage_label(value) else clean_user_factor(value)
     data[[field]][rows] <- value
     editor_buffer_rv(data)
+    selectRows(editor_proxy, NULL)
   }
 
   observeEvent(input$editor_table_cell_edit, {
@@ -1362,6 +1360,7 @@ server <- function(input, output, session) {
     applied_editor_rv(df)
     editor_rv(df)
     editor_buffer_rv(df)
+    selectRows(editor_proxy, NULL)
   }, ignoreInit = TRUE)
   
   current_editor_map <- reactive({

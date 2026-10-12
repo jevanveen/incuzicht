@@ -404,6 +404,17 @@ including other pages and rows hidden by filters. Sorting and paging
 preserve the underlying condition identities. Apply edits commits the
 buffered changes to analysis and refreshes matching-well counts; Reset
 all edits restores the imported guesses.</p>
+<p>Use Clear selection above the table to deselect all rows, including
+selections on other pages. Selections also clear automatically after
+cell edits, bulk updates, Apply edits, and resets. Select the intended
+rows again before making another selected-row update.</p>
+<p>Receptor parsing preserves amino-acid substitution labels, such as
+ERa-D538G, ERa-Y537S, and ERa-E380Q, as distinct receptors. NOER is a
+separate receptor label, not a missing assignment. Combinations such as
+ERa-D538G;NOER become ER_a-D538G + NOER. These labels remain separate in
+plots and AUC exports. Condition-only exports without well coordinates
+can be analyzed, but cannot produce a well-based .zicht map; an exported
+map for these files has only column headers.</p>
 <p>Files are parsed once per upload and reused for preview and
 processing. Identical condition labels share parsed guesses across
 channel files and repeated processing within the session. Metadata lives
