@@ -51,6 +51,10 @@ The factor editor uses a paginated, searchable DT table. The Field, Value and up
 
 Use Clear selection above the table to deselect all rows, including selections on other pages. Selections also clear automatically after cell edits, bulk updates, Apply edits, and resets. Select the intended rows again before making another selected-row update.
 
+Sort the factor editor by well_id (the full coordinate), well_letter (A-H), or well_number (numeric 1-12). Shift-click column headings for multi-column sorting. The letter and number columns are read-only and remain blank for conditions without recognized wells.
+
+Cell line is optional. Supplied cell-line labels distinguish condition keys, matching-well counts, and AUC replicate groups; blank, whitespace-only, and missing values all mean unspecified, not a wildcard matching every cell line. Leaving cell line blank does not cause an incomplete-metadata warning. AUC matrices include a cell_line column only when at least one exported condition has a supplied value, keeping different cell lines in separate row groups. With all cell lines blank, the original matrix format is unchanged.
+
 Receptor parsing preserves amino-acid substitution labels, such as ERa-D538G, ERa-Y537S, and ERa-E380Q, as distinct receptors. NOER is a separate receptor label, not a missing assignment. Combinations such as ERa-D538G;NOER become ER_a-D538G + NOER. These labels remain separate in plots and AUC exports. Condition-only exports without well coordinates can be analyzed, but cannot produce a well-based .zicht map; an exported map for these files has only column headers.
 
 Files are parsed once per upload and reused for preview and processing. Identical condition labels share parsed guesses across channel files and repeated processing within the session. Metadata lives in a separate well table: changing labels does not repeat normalization or numerical AUC integration. Conflicting channel metadata still blocks analysis until corrected.
@@ -67,7 +71,7 @@ Each plate has a hidden identifier. Each well remains separate through normaliza
 
 Plate maps require well, hormone, and receptor columns. Optional passage, expt, and cell_line columns populate the factor editor. Exported .zicht maps also include plate_id so repeated well names on different plates survive export and reimport. A map without plate_id is accepted for a single plate only. For multiple plates, import a map exported from the corresponding plate assignments; unmatched identifiers are rejected rather than applied to another plate. Automatically assigned identifiers are reproducible for the same inputs and pairing order; manual Separate choices are tied to the corresponding source file and occurrence.
 
-Assign experiment and cell line in the factor editor, then Apply edits. A warning above the plots identifies missing metadata and distinct wells or plates with identical experiment/cell-line/passage/receptor/treatment labels. Identical labels may be intentional replicates; their data remain separate. Reprocessing resets factor edits.
+Assign experiment and, optionally, cell line in the factor editor, then Apply edits. A warning above the plots identifies missing required metadata and distinct wells or plates with identical experiment/cell-line/passage/receptor/treatment labels. Identical labels may be intentional replicates; their data remain separate. Reprocessing resets factor edits.
 
 # Numerical handling
 
@@ -81,7 +85,7 @@ AUC defaults to missing for any trajectory containing missing measurements. Alte
 
 Time-course plots use receptor colors plus treatment-specific line patterns and point symbols. AUC plots use treatment colors and symbols. Legends show full treatment labels, including doses, and the same treatment keeps its styles when plot filters change. PNG and SVG downloads use the same AUC styling.
 
-AUC matrix downloads and Copy AUC use one column per treatment, with receptor and replicate columns at the left. Replicates stack in rows within each receptor, rather than adding columns for each well. Every AUC is retained individually; unequal replicate counts and missing values produce blank cells. Replicate numbers are assigned independently within each receptor/treatment group and do not establish biological pairing across treatments.
+AUC matrix downloads and Copy AUC use one column per treatment, with receptor and replicate columns at the left, preceded by cell_line when supplied. Replicates stack in rows within each receptor and optional cell-line group, rather than adding columns for each well. Every AUC is retained individually; unequal replicate counts and missing values produce blank cells. Replicate numbers are assigned independently within each receptor/treatment/cell-line group and do not establish biological pairing across treatments.
 
 For example:
 

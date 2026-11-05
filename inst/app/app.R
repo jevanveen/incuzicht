@@ -237,8 +237,11 @@ normalize_factor_key <- function(x) {
     str_squish()
 }
 
-make_factor_key <- function(receptor, treatment) {
-  paste(normalize_factor_key(receptor), normalize_factor_key(treatment), sep = " || ")
+make_factor_key <- function(receptor, treatment, cell_line = "") {
+  base <- paste(normalize_factor_key(receptor), normalize_factor_key(treatment), sep = " || ")
+  cell_line <- coalesce(normalize_factor_key(cell_line), "")
+  cell_line <- rep_len(cell_line, length(base))
+  if_else(cell_line == "", base, paste(base, "cell_line", cell_line, sep = " || "))
 }
 
 make_guess_key <- function(receptor_guess, treatment_guess, passage_guess) {
@@ -432,9 +435,10 @@ update_editor_matching_wells <- function(tbl) {
       well_id = as.character(well_id),
       receptor = clean_user_factor(receptor),
       treatment = clean_user_factor(treatment),
+      cell_line = coalesce(clean_user_factor(cell_line), ""),
       passage = map_distinct_chr(passage, standardize_passage_label)
     ) %>%
-    group_by(plate_id, passage, receptor, treatment) %>%
+    group_by(plate_id, passage, receptor, treatment, cell_line) %>%
     mutate(n_matching_wells = n_distinct(well_id[well_id != ""])) %>%
     ungroup()
 }
@@ -797,15 +801,20 @@ make_treatment_styles <- function(treatments) {
 make_auc_matrix <- function(data) {
   treatments <- sort(unique(as.character(data$treatment)))
   if (!nrow(data)) return(matrix(c("receptor", "replicate"), nrow = 1))
+  identifiers <- c("receptor", "replicate")
+  if ("cell_line" %in% names(data)) {
+    data <- data %>% mutate(cell_line = coalesce(clean_user_factor(cell_line), ""))
+    if (any(data$cell_line != "")) identifiers <- c("cell_line", identifiers)
+  }
   columns <- tibble(treatment = treatments, column_key = paste0("treatment_", seq_along(treatments)))
   wide <- data %>%
     mutate(treatment = as.character(treatment)) %>%
     left_join(columns, by = "treatment") %>%
-    select(receptor, replicate, column_key, auc) %>%
+    select(all_of(identifiers), column_key, auc) %>%
     pivot_wider(names_from = column_key, values_from = auc) %>%
-    arrange(receptor, replicate) %>%
-    select(receptor, replicate, all_of(columns$column_key))
-  rbind(c("receptor", "replicate", treatments), as.matrix(wide))
+    arrange(across(all_of(identifiers))) %>%
+    select(all_of(identifiers), all_of(columns$column_key))
+  rbind(c(identifiers, treatments), as.matrix(wide))
 }
 
 # ---------------------------
@@ -935,6 +944,7 @@ ui <- fluidPage(
                    actionButton("clear_editor_selection", "Clear selection"))
           ),
           br(),
+          tags$p("Sort using the well_id, well_letter, or well_number column heading; Shift-click headings to combine sorts. Cell line is optional: supplied values distinguish conditions, while blank values remain unspecified."),
           DTOutput("editor_table")
         ),
         
@@ -1276,7 +1286,10 @@ server <- function(input, output, session) {
   editable_fields <- c("expt", "cell_line", "passage", "receptor", "treatment")
 
   editor_display <- function(data) {
-    data %>% select(condition_id, file, well_id, expt, cell_line, passage, receptor, treatment,
+    data %>%
+      mutate(well_letter = na_if(str_extract(extract_well_id(well_id), "^[A-H]"), ""),
+             well_number = as.integer(str_extract(extract_well_id(well_id), "[0-9]+$"))) %>%
+      select(condition_id, file, well_id, well_letter, well_number, expt, cell_line, passage, receptor, treatment,
                     condition, n_matching_wells, original_guess)
   }
   
@@ -1353,7 +1366,7 @@ server <- function(input, output, session) {
         receptor = clean_user_factor(receptor),
         treatment = clean_user_factor(treatment),
         passage = purrr::map_chr(passage, standardize_passage_label),
-        factor_key = make_factor_key(receptor, treatment)
+        factor_key = make_factor_key(receptor, treatment, cell_line)
       ) %>%
       update_editor_matching_wells()
     
@@ -1373,7 +1386,7 @@ server <- function(input, output, session) {
         receptor = clean_user_factor(receptor),
         treatment = clean_user_factor(treatment),
         passage = purrr::map_chr(passage, standardize_passage_label),
-        factor_key = make_factor_key(receptor, treatment)
+        factor_key = make_factor_key(receptor, treatment, cell_line)
       ) %>%
       select(condition_id, passage, receptor, treatment, factor_key, expt, cell_line)
   })
@@ -1432,7 +1445,7 @@ server <- function(input, output, session) {
         treatment = factor(clean_user_factor(treatment)),
         expt = coalesce(clean_user_factor(expt), ""),
         cell_line = coalesce(clean_user_factor(cell_line), ""),
-        factor_key = make_factor_key(receptor, treatment)
+        factor_key = make_factor_key(receptor, treatment, cell_line)
       )
   })
 
@@ -1456,8 +1469,8 @@ server <- function(input, output, session) {
   plate_layout_data <- reactive({
     req(identical(input$main_tabs, "Plate map"))
     condition_metadata() %>%
-      distinct(plate_id, well_id, passage, receptor, treatment) %>%
-      group_by(plate_id, passage, receptor, treatment) %>%
+      distinct(plate_id, well_id, passage, receptor, treatment, cell_line) %>%
+      group_by(plate_id, passage, receptor, treatment, cell_line) %>%
       mutate(n_matching_wells = n_distinct(well_id[well_id != ""])) %>%
       ungroup() %>%
       make_plate_preview_tables()
@@ -1559,13 +1572,13 @@ server <- function(input, output, session) {
     metadata <- condition_metadata() %>%
       distinct(plate_id, well_key, well_id, expt, cell_line, passage, receptor, treatment)
     missing <- metadata %>% filter(
-      expt == "" | cell_line == "" | is.na(passage) | passage == "Passage_NA" |
+      expt == "" | is.na(passage) | passage == "Passage_NA" |
         is.na(receptor) | receptor == "" | is.na(treatment) | treatment == "" | well_id == ""
     )
     repeated <- metadata %>% count(expt, cell_line, passage, receptor, treatment) %>% filter(n > 1)
     conflicts <- metadata %>% count(plate_id, well_key) %>% filter(n > 1)
     messages <- character()
-    if (nrow(missing)) messages <- c(messages, paste(nrow(missing), "well metadata records are incomplete. Assign experiment, cell line, passage, receptor and treatment; check unrecognized wells."))
+    if (nrow(missing)) messages <- c(messages, paste(nrow(missing), "well metadata records are incomplete. Assign experiment, passage, receptor and treatment; check unrecognized wells. Cell line is optional."))
     if (nrow(repeated)) messages <- c(messages, paste(nrow(repeated), "metadata combinations identify multiple wells or plates. Confirm intentional replicates or add missing metadata. Each well remains separate."))
     if (nrow(conflicts)) messages <- c(messages, paste(nrow(conflicts), "wells have conflicting metadata across channels. Resolve these in the factor editor before analysis."))
     if (!length(messages)) return(NULL)
@@ -1758,7 +1771,7 @@ server <- function(input, output, session) {
   auc_export_rows <- reactive({
     auc_preview() %>%
       arrange(receptor, treatment, expt, cell_line, passage, plate_id, well_key) %>%
-      group_by(receptor, treatment) %>%
+      group_by(receptor, treatment, cell_line) %>%
       mutate(replicate = row_number()) %>%
       ungroup()
   })
