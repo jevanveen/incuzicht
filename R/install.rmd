@@ -69,6 +69,8 @@ Each plate has a hidden identifier. Each well remains separate through normaliza
 
 96-well coordinates A1 through H12 are supported, including lowercase and zero-padded forms such as a01. Unrecognized well labels retain separate condition identities and are flagged for review.
 
+Passage is read from the Incucyte condition's numeric parentheses immediately before its seeding density: for example, p1 (69) 50K / well means Passage_69, not Passage_1. This per-condition passage takes precedence over a p-number elsewhere in the label and over the file's Passage header, allowing different passages on one plate. A supplied plate-map passage still takes priority. If this export pattern is absent, the parser uses a lowercase p-number label (such as p69), then the file header. Well coordinates, arbitrary parenthesized numbers without seeding density, and hormone labels such as P4 are not treated as this parenthesized passage field.
+
 Plate maps require well, hormone, and receptor columns. Optional passage, expt, and cell_line columns populate the factor editor. Exported .zicht maps also include plate_id so repeated well names on different plates survive export and reimport. A map without plate_id is accepted for a single plate only. For multiple plates, import a map exported from the corresponding plate assignments; unmatched identifiers are rejected rather than applied to another plate. Automatically assigned identifiers are reproducible for the same inputs and pairing order; manual Separate choices are tied to the corresponding source file and occurrence.
 
 Assign experiment and, optionally, cell line in the factor editor, then Apply edits. A warning above the plots identifies missing required metadata and distinct wells or plates with identical experiment/cell-line/passage/receptor/treatment labels. Identical labels may be intentional replicates; their data remain separate. Reprocessing resets factor edits.
@@ -85,14 +87,13 @@ AUC defaults to missing for any trajectory containing missing measurements. Alte
 
 Time-course plots use receptor colors plus treatment-specific line patterns and point symbols. AUC plots use treatment colors and symbols. Legends show full treatment labels, including doses, and the same treatment keeps its styles when plot filters change. PNG and SVG downloads use the same AUC styling.
 
-AUC matrix downloads and Copy AUC use one column per treatment, with receptor and replicate columns at the left, preceded by cell_line when supplied. Replicates stack in rows within each receptor and optional cell-line group, rather than adding columns for each well. Every AUC is retained individually; unequal replicate counts and missing values produce blank cells. Replicate numbers are assigned independently within each receptor/treatment/cell-line group and do not establish biological pairing across treatments.
+AUC matrix downloads and Copy AUC use two header rows: treatment headings above rep1, rep2, rep3, and further replicate subcolumns as needed. Each receptor occupies one row, with a separate row for each supplied cell line and an optional cell_line column at the left. All treatments have the same number of replicate subcolumns, based on the largest receptor/treatment/cell-line group, not the total number of wells across receptors. Every AUC is retained individually; unequal replicate counts and missing values produce blank cells. Plate and well identifiers are excluded. Replicate numbers are assigned independently within each receptor/treatment/cell-line group and do not establish biological pairing across treatments.
 
 For example:
 
-| receptor | replicate | VEH | 30NM E2 |
-|----------|-----------|-----|---------|
-| ER_a | 1 | 10 | 15 |
-| ER_a | 2 | 12 | 18 |
-| ER_a | 3 | 11 | |
+| | 30NM E2 | 30NM E2 | 30NM E2 | VEH | VEH | VEH |
+|----------|---------|---------|---------|-----|-----|-----|
+| receptor | rep1 | rep2 | rep3 | rep1 | rep2 | rep3 |
+| ER_a | 15 | 18 | | 10 | 12 | 11 |
 
 The separate AUC values and coverage CSV includes experiment, cell line, passage, treatment, generic replicate number and coverage details, without plate or well identifiers. Internal identities and .zicht plate-map exports remain intact.

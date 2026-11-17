@@ -366,6 +366,11 @@ extract_treatment <- function(x) {
 }
 
 extract_passage_from_condition <- function(x) {
+  exported_passage <- str_match(x, regex(
+    "\\(\\s*([0-9]+)\\s*\\)\\s*[0-9]+(?:\\.[0-9]+)?\\s*k?\\s*/\\s*well\\b",
+    ignore_case = TRUE
+  ))
+  if (!is.na(exported_passage[1, 2])) return(paste0("Passage_", exported_passage[1, 2]))
   m <- str_match(x, "\\bp([0-9]+)\\b")
   if (!is.na(m[1, 2])) return(paste0("Passage_", m[1, 2]))
   NA_character_
@@ -800,21 +805,24 @@ make_treatment_styles <- function(treatments) {
 
 make_auc_matrix <- function(data) {
   treatments <- sort(unique(as.character(data$treatment)))
-  if (!nrow(data)) return(matrix(c("receptor", "replicate"), nrow = 1))
-  identifiers <- c("receptor", "replicate")
+  if (!nrow(data)) return(matrix(c("", "receptor"), ncol = 1))
+  identifiers <- "receptor"
   if ("cell_line" %in% names(data)) {
     data <- data %>% mutate(cell_line = coalesce(clean_user_factor(cell_line), ""))
     if (any(data$cell_line != "")) identifiers <- c("cell_line", identifiers)
   }
-  columns <- tibble(treatment = treatments, column_key = paste0("treatment_", seq_along(treatments)))
+  columns <- expand_grid(treatment = treatments, replicate = seq_len(max(data$replicate))) %>%
+    mutate(column_key = paste0("auc_", row_number()))
   wide <- data %>%
     mutate(treatment = as.character(treatment)) %>%
-    left_join(columns, by = "treatment") %>%
+    left_join(columns, by = c("treatment", "replicate")) %>%
+    mutate(column_key = factor(column_key, levels = columns$column_key)) %>%
     select(all_of(identifiers), column_key, auc) %>%
-    pivot_wider(names_from = column_key, values_from = auc) %>%
+    pivot_wider(names_from = column_key, values_from = auc, names_expand = TRUE) %>%
     arrange(across(all_of(identifiers))) %>%
     select(all_of(identifiers), all_of(columns$column_key))
-  rbind(c(identifiers, treatments), as.matrix(wide))
+  rbind(c(rep("", length(identifiers)), columns$treatment),
+        c(identifiers, paste0("rep", columns$replicate)), as.matrix(wide))
 }
 
 # ---------------------------
